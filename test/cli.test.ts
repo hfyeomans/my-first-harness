@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -29,7 +29,11 @@ test("prints help", async () => {
   const code = await main(["--help"], streams);
   assert.equal(code, 0);
   assert.match(streams.out(), /read_file/);
+  assert.match(streams.out(), /write_file/);
+  assert.match(streams.out(), /edit_file/);
+  assert.match(streams.out(), /bash/);
   assert.match(streams.out(), /OPENAI_API_KEY/);
+  assert.match(streams.out(), /your permissions/);
 });
 
 test("names the provider API key when it is missing", async () => {
@@ -48,6 +52,42 @@ test("faux provider reads a file and prints the tool call to stderr", async () =
     assert.equal(code, 0);
     assert.match(streams.err(), /tool read_file \{"path":"sample.txt"\}/);
     assert.match(streams.out(), /contents-from-disk/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("names the anthropic API key when haiku is requested without one", async () => {
+  const streams = io(process.cwd(), {});
+  const code = await main(
+    ["-p", "Read sample.txt", "--provider", "anthropic", "--model", "claude-haiku-4-5"],
+    streams,
+  );
+  assert.equal(code, 1);
+  assert.match(streams.err(), /ANTHROPIC_API_KEY/);
+});
+
+test("faux provider reads, edits, and verifies with bash", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-edit-"));
+  try {
+    await writeFile(path.join(dir, "sample.txt"), "hello from disk\n");
+    const streams = io(dir);
+    const code = await main(
+      ["-p", 'Edit sample.txt, replace "hello" with "goodbye", and verify', "--provider", "faux", "--cwd", dir],
+      streams,
+    );
+    assert.equal(code, 0, streams.err());
+    const err = streams.err();
+    const readAt = err.indexOf('tool read_file {"path":"sample.txt"}');
+    const editAt = err.indexOf(
+      'tool edit_file {"path":"sample.txt","old_string":"hello","new_string":"goodbye"}',
+    );
+    const bashAt = err.indexOf(`tool bash {"command":"grep -F -n -- 'goodbye' 'sample.txt'"}`);
+    assert.ok(readAt >= 0 && editAt > readAt && bashAt > editAt);
+    assert.match(streams.out(), /Updated sample\.txt/);
+    assert.match(streams.out(), /exit_code: 0/);
+    assert.match(streams.out(), /goodbye from disk/);
+    assert.equal(await readFile(path.join(dir, "sample.txt"), "utf8"), "goodbye from disk\n");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

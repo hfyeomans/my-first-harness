@@ -1,5 +1,6 @@
 import type { Message, ToolCall } from "@earendil-works/pi-ai";
 import { toolCallsOf, toolResultMessage } from "./messages.js";
+import { findTool } from "./registry.js";
 import type { AgentModel, Tool, ToolContext, ToolResult } from "./types.js";
 
 /** Model calls before the loop stops. Each call's tool calls still run. */
@@ -56,7 +57,7 @@ async function executeTool(
   tools: readonly Tool<any>[],
   ctx: ToolContext,
 ): Promise<ToolResult> {
-  const tool = tools.find((candidate) => candidate.name === call.name);
+  const tool = findTool(tools, call.name);
   if (!tool) return { ok: false, error: `Unknown tool: ${call.name}` };
 
   try {

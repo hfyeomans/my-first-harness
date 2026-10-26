@@ -1,6 +1,6 @@
 # my-first-harness
 
-A small coding agent you can read in one sitting. This step is the agent loop and one tool, `read_file`. Model calls go through `@earendil-works/pi-ai`. The loop itself is `runAgent` in this repo.
+A small coding agent you can read in one sitting. The loop is `runAgent` in `src/loop.ts`. Model calls go through `@earendil-works/pi-ai`. This step adds a tool registry and three tools that change the workspace: `write_file`, `edit_file`, and `bash`. `read_file` is still there.
 
 `@earendil-works/pi-ai` is the published name of the `packages/ai` package from [pi](https://github.com/earendil-works/pi). This repo was written against version 1.4.0.
 
@@ -20,7 +20,7 @@ pnpm build
 
 Tool calls are printed to stderr, so you can watch the loop. The final answer is printed to stdout.
 
-Offline, with no API key, `--provider faux` is a scripted stand-in (`createFauxModel` in `src/faux-model.ts`). It is not a model. It takes the first filename in your prompt, calls `read_file`, and prints what the tool returned:
+Offline, with no API key, `--provider faux` is a scripted stand-in (`createFauxModel` in `src/faux-model.ts`). It is not a model. With no edit in the prompt, it takes the first filename, calls `read_file`, and prints what the tool returned:
 
 ```bash
 printf 'hello from disk\n' > sample.txt
@@ -37,6 +37,25 @@ hello from disk
 
 The `tool` line is stderr. The answer is stdout.
 
+If the prompt contains `replace "..." with "..."`, the same script reads the file, calls `edit_file`, then runs `grep` to check the new text:
+
+```bash
+pnpm exec tsx src/cli.ts -p 'Edit sample.txt, replace "hello" with "goodbye", and verify' --provider faux
+```
+
+```
+tool read_file {"path":"sample.txt"}
+tool edit_file {"path":"sample.txt","old_string":"hello","new_string":"goodbye"}
+tool bash {"command":"grep -F -n -- 'goodbye' 'sample.txt'"}
+Updated sample.txt.
+exit_code: 0
+stdout:
+1:goodbye from disk
+stderr:
+```
+
+That overwrites `sample.txt`. The three `tool` lines are stderr. The rest is stdout.
+
 After `pnpm build`, the compiled CLI is the same program:
 
 ```bash
@@ -52,9 +71,9 @@ Pick a provider and a model id with flags or environment variables:
 | Flag | Environment variable | Meaning |
 | --- | --- | --- |
 | `--provider` | `MYAGENT_PROVIDER` | Provider id, such as `openai`, `anthropic`, or `google`. `faux` is the offline script. |
-| `--model` | `MYAGENT_MODEL` | Model id, such as `gpt-4o-mini`. Unused for `faux`. |
+| `--model` | `MYAGENT_MODEL` | Model id, such as `gpt-4o-mini` or `claude-haiku-4-5`. Unused for `faux`. |
 | `--max-turns` | `MYAGENT_MAX_TURNS` | Maximum model calls. Default 8. |
-| `--cwd` | | Working directory for `read_file`. Default: where you ran the command. |
+| `--cwd` | | Working directory for the tools. Default: where you ran the command. |
 | `-p`, `--prompt` | | The prompt. |
 
 The API key is the provider's own variable. pi-ai reads it. This program does not have a separate key variable.
@@ -68,24 +87,70 @@ The API key is the provider's own variable. pi-ai reads it. This program does no
 Other providers use the variables documented in the `@earendil-works/pi-ai` README. A few need an extra variable besides the key (Azure needs `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; Cloudflare needs an account id). Amazon Bedrock and Vertex AI can use ambient credentials instead of one of the variables above. If you name a provider this program knows and none of its key variables are set, `myagent` exits and tells you which variable to set.
 
 ```bash
-export OPENAI_API_KEY=sk-...
-node dist/cli.js -p "Read sample.txt and quote the first line" --provider openai --model gpt-4o-mini
+export ANTHROPIC_API_KEY=sk-ant-...
+node dist/cli.js -p "Read sample.txt and quote the first line" --provider anthropic --model claude-haiku-4-5
 ```
 
-`gpt-4o-mini`, `claude-sonnet-4-5`, and `gemini-2.5-flash` are ids in the pi-ai 1.4.0 catalog.
+`gpt-4o-mini`, `claude-haiku-4-5`, `claude-sonnet-4-5`, and `gemini-2.5-flash` are ids in the pi-ai 1.4.0 catalog.
 
 ## How the loop works
 
 Start at `runAgent` in `src/loop.ts`.
 
-1. It copies the history and calls `model.complete`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the `read_file` schema and a short system prompt. The CLI chooses the model in `main` (`src/cli.ts`): `createFauxModel`, or `loadPiModel`.
+1. It copies the history and calls `model.complete`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the declarations from `toolDeclarations` and a short system prompt. The prompt names the four tools, says that a non-zero bash exit is a result, and says that bash runs with the user's permissions. The CLI passes `agentTools` from `src/registry.ts`. A test can pass a different list.
 2. The assistant message comes back as pi-ai sent it. `toolCallsOf` (`src/messages.ts`) collects content blocks whose `type` is `"toolCall"`.
 3. When there are no tool calls, `runAgent` returns. That assistant text is the answer. `finalAnswer` finds it, and `main` writes it to stdout.
-4. When there are tool calls, `main`'s `onToolCall` writes a `tool <name> <json>` line to stderr. Then the private `executeTool` in `src/loop.ts` looks up the tool. An unknown name becomes `{ ok: false, error }`. Otherwise it calls `parse` and `run`. If either throws, that error is also `{ ok: false }`. The loop keeps going.
+4. When there are tool calls, `main`'s `onToolCall` writes a `tool <name> <json>` line to stderr. Then the private `executeTool` calls `findTool`. An unknown name becomes `{ ok: false, error }`. Otherwise it calls `parse` and `run`. If either throws, that error is also `{ ok: false }`. The loop keeps going.
 5. `toolResultMessage` is the only conversion. It turns our `ToolResult` into a pi-ai message with `role: "toolResult"`, `toolCallId`, `toolName`, and `isError`. That message is appended, and the loop calls the model again with the whole transcript.
 6. Each model call counts as one turn. `DEFAULT_MAX_TURNS` is 8. Tool calls from the last allowed call still run, and then `runAgent` returns without another model call. `finalAnswer` is undefined in that case, and `main` exits with status 1 and writes `stopped after N model turns` to stderr.
 
-The only tool in this step is `readFileTool` in `src/read-file.ts`. `parse` checks the arguments with pi-ai's `validateToolArguments`. `run` reads a UTF-8 file whose path stays inside the working directory. A missing file, a directory, bytes that are not valid UTF-8, a UTF-8 file that contains a NUL byte, a file over 200000 bytes, or a path that escapes the directory comes back as `{ ok: false, error }`. A file of valid UTF-8 with no NUL byte is returned, including one that happens to be data rather than prose.
+## The tool registry
+
+`src/registry.ts` is the list of tools.
+
+`agentTools` is a plain array: `read_file`, `write_file`, `edit_file`, `bash`. `findTool(tools, name)` walks that array. `toolDeclarations(tools)` maps each tool through pi-ai's `toToolDeclaration`, which keeps `name`, `description`, and `parameters` and drops `parse` and `run`. That object is what the provider sees. The functions stay in this process.
+
+Four tools do not need a class, a map built at startup, or a register function. Those would only wrap the same three things: the list, the lookup, and the declaration. A new tool later is a file plus one line in the array. The loop still takes the array as an argument, which is why a test can pass one tool, or a tool that throws, without editing the registry.
+
+## Why tool errors look like this
+
+Every tool returns `ToolResult`: `{ ok: true, output }` or `{ ok: false, error }`. `executeTool` turns a throw, a failed `parse`, or an unknown name into `{ ok: false, error }` too. `toolResultMessage` sets `isError` from `ok`. The model reads that text on the next turn and can call the tool again. Throwing out of the loop would end the turn instead.
+
+`parse` (`src/parse-args.ts`) checks the arguments with pi-ai's `validateToolArguments`. A missing field or a non-object is a thrown error, which the loop turns into the same `{ ok: false, error }`. The message starts with `Validation failed`, so the model can see which field was wrong.
+
+### read_file, write_file, and edit_file
+
+The path rules live in `src/workspace-path.ts`. `read_file` and `write_file` both use them, so the checks are not copied. `edit_file` reads with `read_file` and writes with the same writer as `write_file`.
+
+A path must be relative. `..` that stays inside the working directory is allowed. A path that resolves outside it is not. The opened file is checked again by its descriptor, not only by the name, so a symlink that points outside is refused. On Linux that check follows `/proc/self/fd`, which is the descriptor rather than a second lookup of the name. A new file is created through the parent directory's descriptor after that directory has been checked, and only if the parent already exists. `O_NOFOLLOW` refuses a symlink as the last component of a create.
+
+A refused path does not create or change a file. The error says which check failed (`Path escapes the working directory.`, `No such file: ...`, `... is not a file.`, `No such directory: ...`). The same shape as a missing `read_file`. The cap for both reading and writing is 200000 bytes.
+
+`edit_file` has two extra failures, and both leave the file as it was:
+
+- `old_string was not found in <path>.` The text did not match. Read the file and try the exact characters.
+- `old_string appears N times in <path>. Include more surrounding text so it matches once.` Replacing every copy would be a guess. One exact match is the whole behavior. A longer `old_string` makes it unique, which is why the count is in the error.
+
+`old_string` is literal text, not a regular expression. An empty `old_string` fails validation. `new_string` may be empty, which deletes the matched text.
+
+### bash
+
+`bash` runs the command with `bash -c` in the working directory, with your environment. The result is text the model can read:
+
+```
+exit_code: 0
+stdout:
+hello
+stderr:
+```
+
+A non-zero exit uses the same shape, with `ok: true`, so `isError` is false. A failing test or a compiler error is information for the next turn, not a broken tool. Stdout and stderr are captured separately, not interleaved.
+
+Each stream stops at 100000 bytes. The label becomes `stdout (truncated):` or `stderr (truncated):`. The cut does not split a UTF-8 character. The process is still allowed to finish, so the exit code is the real one.
+
+If the command runs longer than 30000 milliseconds, the tool kills the process group and returns `{ ok: false, error: "Command timed out after 30000ms." }`. There is no exit code to show, and output from before the kill is discarded. Killing the group, not only the bash process, matters because a child such as `sleep` would otherwise keep the pipes open and the tool would wait.
+
+`bash` is not jailed to the working directory. It runs with your permissions and can `cd` anywhere you can. `read_file`, `write_file`, and `edit_file` cannot. This step does not ask before it runs a command. A later step can add a permission check. There is no safety prompt here.
 
 ## Types
 
@@ -99,6 +164,6 @@ pi-ai's shapes, and the sketch they replace:
 | `{ role: "assistant", text, toolCalls }` | `{ role: "assistant", content }`. Text and tool calls are content blocks. A tool call has `arguments`, not `args`. |
 | `{ role: "tool", callId, result }` | `{ role: "toolResult", toolCallId, toolName, content, isError }`. Our `ToolResult` (`{ ok: true, output }` or `{ ok: false, error }`) is converted by `toolResultMessage`. |
 | `Tool.schema: JSONSchema` | `Tool.parameters`, a TypeBox schema, which is what pi-ai's `Tool` and `validateToolArguments` take. |
-| `runAgent(history, tools)` | `runAgent(history, tools, options)`. `options.model` is required because the loop does not pick a provider itself. `options.maxTurns`, `options.cwd`, and `options.onToolCall` live there too. |
+| `runAgent(history, tools)` | `runAgent(history, tools, options)`. `options.model` is required because the loop does not pick a provider itself. `options.maxTurns`, `options.cwd`, and `options.onToolCall` live there too. The CLI passes `agentTools`. |
 
 `ToolContext` is `{ cwd: string }`.
