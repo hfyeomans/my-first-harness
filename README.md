@@ -111,7 +111,7 @@ Start at `runAgent` in `src/loop.ts`.
 
 ## Sessions
 
-Every run is saved. `myagent` appends each message to `.myagent/sessions/<id>.jsonl` under the working directory as soon as the message exists, one JSON record per line. The session id goes to stderr before the model runs.
+Every run is saved. `myagent` appends each message to `.myagent/sessions/<id>.jsonl` under the working directory as soon as the message exists, one JSON record per line. The directory is created mode `0700` and each new file mode `0600`, because the lines hold tool output. The session id goes to stderr before the model runs.
 
 To continue a session, pass its id to `--resume` with a new prompt. `--resume` with no id continues the session written to most recently, by file modification time. The model sees the earlier conversation. With no filename in the prompt, the faux script answers by quoting the prompt before it:
 
@@ -140,7 +140,7 @@ The most recent messages stay word for word. An assistant message and the tool r
 
 The summary is a separate model call with its own prompt and no tools. It becomes a user message at the front of the history, so after a compaction `runAgent` returns a history that starts with the summary. The session file keeps every original line. Compaction appends one `compaction` record holding the summary and the `seq` where the kept messages start. `--resume` rebuilds the history from the newest one.
 
-Tool-result text in that summary request is cut to a head and a tail, marked `[... N bytes elided]`, until the estimate is under half the window. The session line keeps the full text.
+User text, assistant text, and tool-result text in that summary request are cut to a head and a tail, marked `[... N bytes elided]`, until the estimate is under half the window. The session line keeps the full text.
 
 If the provider still says the request is too long (pi-ai's `isContextOverflow`), the loop compacts again, keeping only the newest group, and retries that call once. If there is nothing older to summarize, or the retry is too long as well, the run fails with `The conversation does not fit in the model's context window.`
 

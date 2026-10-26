@@ -82,8 +82,8 @@ export async function createSession(dir: string, info: NewSession): Promise<Open
   const id = newSessionId(now);
   const file = sessionFile(dir, id);
   const header: HeaderRecord = { type: "session", version: 1, id, created_at: now.toISOString(), ...info };
-  await mkdir(dir, { recursive: true });
-  await writeFile(file, line(header), { flag: "wx" });
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await writeFile(file, line(header), { flag: "wx", mode: 0o600 });
   return { id, session: sessionOver(EMPTY, file), warning: undefined };
 }
 
