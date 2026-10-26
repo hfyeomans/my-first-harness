@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import { fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
+import { contentText, fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
+import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { createFauxModel } from "../src/faux-model.js";
 import { runAgent } from "../src/loop.js";
-import { finalAnswer, toolCallsOf } from "../src/messages.js";
+import { finalAnswer, toolCallsOf, toolResultMessage } from "../src/messages.js";
 import { readFileTool } from "../src/read-file.js";
 import { agentTools } from "../src/registry.js";
 import { createSession, resumeSession } from "../src/session.js";
@@ -182,5 +183,78 @@ describe("compaction", () => {
     } finally {
       await rm(sessions, { recursive: true, force: true });
     }
+  });
+
+  test("a tiny faux window compacts an oversized tool result and resume rebuilds history", async () => {
+    const sessions = path.join(dir, "sessions-huge");
+    await mkdir(sessions);
+    const window = 200;
+    const huge = "H".repeat(200_000);
+    const dropped = fauxToolCall("read_file", { path: "big.txt" }, { id: "faux-1" });
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const faux = createFauxModel({ contextWindow: window });
+    const model: AgentModel = {
+      complete: (history, tools) => faux.complete(history, tools),
+      context: {
+        window,
+        async summarize(input) {
+          const tokens = estimateContextTokens(input.replaced).tokens;
+          if (tokens > window) {
+            throw new Error("Compaction failed. The conversation does not fit in the model's context window.");
+          }
+          const result = input.replaced.find((message) => message.role === "toolResult");
+          assert.ok(result);
+          const text = contentText(result.content);
+          assert.match(text, /\[\.\.\. \d+ bytes elided\]/);
+          assert.ok(text.length < huge.length);
+          return faux.context!.summarize(input);
+        },
+      },
+    };
+
+    const messages = await runAgent(
+      [
+        user("Read big.txt"),
+        fauxAssistantMessage([dropped], { stopReason: "toolUse", timestamp: 2 }),
+        toolResultMessage(dropped, { ok: true, output: huge }),
+        user("What did I ask before?"),
+      ],
+      agentTools,
+      { model, cwd: dir, session: opened.session },
+    );
+
+    assert.match(finalAnswer(messages) ?? "", /^Earlier you asked: Read big\.txt\n\(faux summary/);
+    assert.equal(JSON.stringify(messages).includes(huge), false);
+    const resumed = await resumeSession(sessions, opened.id);
+    assert.deepEqual(resumed.session.messages(), messages);
+  });
+
+  test("a new faux tool call id does not reuse a kept id after compaction", async () => {
+    const kept = fauxToolCall("read_file", { path: "kept.txt" }, { id: "faux-2" });
+    const dropped = fauxToolCall("read_file", { path: "big.txt" }, { id: "faux-1" });
+    await writeFile(path.join(dir, "other.txt"), "hi\n");
+    const seen: string[] = [];
+
+    const messages = await runAgent(
+      [
+        user("Read big.txt"),
+        fauxAssistantMessage([dropped], { stopReason: "toolUse", timestamp: 2 }),
+        toolResultMessage(dropped, { ok: true, output: "H".repeat(20_000) }),
+        fauxAssistantMessage([kept], { stopReason: "toolUse", timestamp: 4 }),
+        toolResultMessage(kept, { ok: true, output: "kept" }),
+        user("Read other.txt"),
+      ],
+      agentTools,
+      {
+        model: createFauxModel({ contextWindow: 2_000 }),
+        cwd: dir,
+        onToolCall: (call) => seen.push(call.id),
+      },
+    );
+
+    assert.deepEqual(seen, ["faux-3"]);
+    const ids = messages.flatMap((message) => (message.role === "assistant" ? toolCallsOf(message).map((call) => call.id) : []));
+    assert.ok(ids.includes("faux-2"));
+    assert.equal(new Set(ids).size, ids.length);
   });
 });
