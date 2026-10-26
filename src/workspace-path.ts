@@ -1,5 +1,6 @@
+import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { open, realpath, type FileHandle } from "node:fs/promises";
+import { link, lstat, open, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 export const MAX_FILE_BYTES = 200_000;
@@ -13,7 +14,7 @@ export async function openInside(
   rel: string,
   cwd: string,
   flags: string | number,
-): Promise<{ ok: true; handle: FileHandle } | PathFailure> {
+): Promise<{ ok: true; handle: FileHandle; realPath: string } | PathFailure> {
   const located = locate(rel, cwd);
   if (!located.ok) return { ok: false, error: located.error, missing: false };
 
@@ -44,69 +45,161 @@ export async function openInside(
     await handle.close();
     return { ok: false, error: "Path escapes the working directory.", missing: false };
   }
-  return { ok: true, handle };
+  return { ok: true, handle, realPath: opened };
 }
 
 /**
- * Create a new file inside `cwd`. The parent must already exist.
- * Nothing is written when the parent resolves outside cwd.
+ * Write `content` inside `cwd`. An existing file is replaced only after the new
+ * bytes are synced in the same directory. `beforeRename` runs after that sync
+ * and before the rename; a returned string aborts and deletes the temporary file.
  */
-export async function createInside(rel: string, cwd: string, content: string): Promise<{ ok: true } | PathFailure> {
+export async function commitInside(
+  rel: string,
+  cwd: string,
+  content: string,
+  beforeRename?: () => Promise<string | undefined>,
+): Promise<{ ok: true } | PathFailure> {
   const located = locate(rel, cwd);
   if (!located.ok) return { ok: false, error: located.error, missing: false };
 
-  const root = await realRootOf(located.root, rel);
-  if (!root.ok) return root;
-
-  const parentFull = path.dirname(located.full);
-  let parent: FileHandle;
-  try {
-    parent = await open(parentFull, "r");
-  } catch (err) {
-    const shown = parentLabel(located.root, located.full);
-    if (isEnoent(err)) return { ok: false, error: `No such directory: ${shown}`, missing: true };
-    if (isEnotdir(err)) return { ok: false, error: `${shown} is not a directory.`, missing: false };
-    return { ok: false, error: errorText(err), missing: false };
-  }
-
-  try {
-    const parentReal = await locationOf(parent, parentFull);
-    if (escapes(root.realRoot, parentReal)) {
-      return { ok: false, error: "Path escapes the working directory.", missing: false };
-    }
-
-    // Create through the directory fd we just checked. Opening the path by name
-    // afterwards is a second lookup. O_NOFOLLOW refuses a symlink as the last
-    // component. Linux can name that fd; elsewhere we fall back to the path,
-    // the same split read_file uses for the opened descriptor.
-    const name = path.basename(located.full);
-    const target = process.platform === "linux" ? `/proc/self/fd/${parent.fd}/${name}` : located.full;
-    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
-    let created: FileHandle;
+  const opened = await openInside(rel, cwd, constants.O_WRONLY);
+  if (opened.ok) {
     try {
-      created = await open(target, flags, 0o666);
-    } catch (err) {
-      if (codeIs(err, "EEXIST")) {
-        return { ok: false, error: `Cannot create ${rel}: the path already exists.`, missing: false };
-      }
-      if (codeIs(err, "ELOOP")) {
-        return { ok: false, error: `Refusing to write through a symlink at ${rel}.`, missing: false };
-      }
-      return { ok: false, error: errorText(err), missing: false };
-    }
-
-    try {
-      await created.writeFile(content);
-      return { ok: true };
+      const info = await opened.handle.stat();
+      if (!info.isFile()) return { ok: false, error: `${rel} is not a file.`, missing: false };
     } catch (err) {
       return { ok: false, error: errorText(err), missing: false };
     } finally {
-      await created.close();
+      await opened.handle.close();
     }
+    return commitInDir(
+      path.dirname(opened.realPath),
+      path.basename(opened.realPath),
+      content,
+      cwd,
+      beforeRename,
+      ".",
+      true,
+      rel,
+    );
+  }
+  if (!opened.missing) return opened;
+
+  // open followed the last component. A dangling symlink is ENOENT there, but the
+  // name itself exists; renaming onto it would replace the symlink.
+  try {
+    const existing = await lstat(located.full);
+    if (existing.isSymbolicLink()) {
+      return { ok: false, error: `Refusing to write through a symlink at ${rel}.`, missing: false };
+    }
+    return { ok: false, error: `Cannot create ${rel}: the path already exists.`, missing: false };
   } catch (err) {
+    if (!isEnoent(err)) return { ok: false, error: errorText(err), missing: false };
+  }
+
+  return commitInDir(
+    path.dirname(located.full),
+    path.basename(located.full),
+    content,
+    cwd,
+    beforeRename,
+    parentLabel(located.root, located.full),
+    false,
+    rel,
+  );
+}
+
+async function commitInDir(
+  dir: string,
+  name: string,
+  content: string,
+  cwd: string,
+  beforeRename: (() => Promise<string | undefined>) | undefined,
+  missingDirLabel: string,
+  replace: boolean,
+  rel: string,
+): Promise<{ ok: true } | PathFailure> {
+  let realRoot: string;
+  try {
+    realRoot = await realpath(path.resolve(cwd));
+  } catch (err) {
+    if (isEnoent(err)) return { ok: false, error: `No such directory: ${missingDirLabel}`, missing: true };
+    return { ok: false, error: errorText(err), missing: false };
+  }
+
+  let parent: FileHandle;
+  try {
+    parent = await open(dir, "r");
+  } catch (err) {
+    if (isEnoent(err)) return { ok: false, error: `No such directory: ${missingDirLabel}`, missing: true };
+    if (isEnotdir(err)) return { ok: false, error: `${missingDirLabel} is not a directory.`, missing: false };
+    return { ok: false, error: errorText(err), missing: false };
+  }
+
+  const tmpName = `.myagent-${process.pid}-${randomBytes(4).toString("hex")}.tmp`;
+  let tmpPath = "";
+  let tmp: FileHandle | undefined;
+  try {
+    const parentReal = await locationOf(parent, dir);
+    if (escapes(realRoot, parentReal) || escapes(realRoot, path.join(parentReal, name))) {
+      return { ok: false, error: "Path escapes the working directory.", missing: false };
+    }
+
+    // Create through the directory fd we just checked. O_NOFOLLOW refuses a
+    // symlink as the temporary name. The original is untouched until rename.
+    tmpPath = fdPath(parent, parentReal, tmpName);
+    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+    tmp = await open(tmpPath, flags, 0o666);
+    await tmp.writeFile(content);
+    await tmp.sync();
+    await tmp.close();
+    tmp = undefined;
+
+    if (beforeRename) {
+      const problem = await beforeRename();
+      if (problem) {
+        await unlinkQuiet(tmpPath);
+        tmpPath = "";
+        return { ok: false, error: problem, missing: false };
+      }
+    }
+
+    const dest = fdPath(parent, parentReal, name);
+    if (replace) {
+      await rename(tmpPath, dest);
+    } else {
+      // link fails if the name appeared after the missing-file check, so a
+      // create does not clobber that file. rename would.
+      await link(tmpPath, dest);
+      await unlinkQuiet(tmpPath);
+    }
+    tmpPath = "";
+    return { ok: true };
+  } catch (err) {
+    if (tmp) await tmp.close().catch(() => {});
+    if (tmpPath) await unlinkQuiet(tmpPath);
+    if (!replace && codeIs(err, "EEXIST")) {
+      return { ok: false, error: `Cannot create ${rel}: the path already exists.`, missing: false };
+    }
+    if (!replace && codeIs(err, "ELOOP")) {
+      return { ok: false, error: `Refusing to write through a symlink at ${rel}.`, missing: false };
+    }
     return { ok: false, error: errorText(err), missing: false };
   } finally {
     await parent.close();
+  }
+}
+
+function fdPath(parent: FileHandle, fallbackDir: string, name: string): string {
+  if (process.platform === "linux") return `/proc/self/fd/${parent.fd}/${name}`;
+  return path.join(fallbackDir, name);
+}
+
+async function unlinkQuiet(file: string): Promise<void> {
+  try {
+    await unlink(file);
+  } catch {
+    // The temporary file is already gone, or it never appeared.
   }
 }
 

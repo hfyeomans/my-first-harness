@@ -122,16 +122,20 @@ Every tool returns `ToolResult`: `{ ok: true, output }` or `{ ok: false, error }
 
 The path rules live in `src/workspace-path.ts`. `read_file` and `write_file` both use them, so the checks are not copied. `edit_file` reads with `read_file` and writes with the same writer as `write_file`.
 
-A path must be relative. `..` that stays inside the working directory is allowed. A path that resolves outside it is not. The opened file is checked again by its descriptor, not only by the name, so a symlink that points outside is refused. On Linux that check follows `/proc/self/fd`, which is the descriptor rather than a second lookup of the name. A new file is created through the parent directory's descriptor after that directory has been checked, and only if the parent already exists. `O_NOFOLLOW` refuses a symlink as the last component of a create.
+A path must be relative. `..` that stays inside the working directory is allowed. A path that resolves outside it is not. The opened file is checked again by its descriptor, not only by the name, so a symlink that points outside is refused. On Linux that check follows `/proc/self/fd`, which is the descriptor rather than a second lookup of the name. The check opens write-only, so a file you can write but not read can still be replaced.
+
+The new bytes go to a temporary file in the directory that was checked. That file is synced, then renamed onto the target. A failed write deletes the temporary file and leaves the original bytes in place. A new file is created only when the parent already exists. `O_NOFOLLOW` refuses a symlink as the temporary name. A dangling symlink is refused rather than replaced. A symlink that stays inside the working directory is followed, and the write replaces the file it points at.
 
 A refused path does not create or change a file. The error says which check failed (`Path escapes the working directory.`, `No such file: ...`, `... is not a file.`, `No such directory: ...`). The same shape as a missing `read_file`. The cap for both reading and writing is 200000 bytes.
 
 `edit_file` has two extra failures, and both leave the file as it was:
 
 - `old_string was not found in <path>.` The text did not match. Read the file and try the exact characters.
-- `old_string appears N times in <path>. Include more surrounding text so it matches once.` Replacing every copy would be a guess. One exact match is the whole behavior. A longer `old_string` makes it unique, which is why the count is in the error.
+- `old_string appears N times in <path>. Include more surrounding text so it matches once.` Replacing every copy would be a guess. One exact match is the whole behavior. A longer `old_string` makes it unique, which is why the count is in the error. Overlapping copies count separately, so `aa` in `aaa` is two matches.
 
 `old_string` is literal text, not a regular expression. An empty `old_string` fails validation. `new_string` may be empty, which deletes the matched text.
+
+After the replacement is synced, `edit_file` reads the file again and skips the rename if the text is no longer what it read. The error is `<path> changed while editing. Read it and try again.` There is no lock around the edit.
 
 ### bash
 
@@ -148,7 +152,7 @@ A non-zero exit uses the same shape, with `ok: true`, so `isError` is false. A f
 
 Each stream stops at 100000 bytes. The label becomes `stdout (truncated):` or `stderr (truncated):`. The cut does not split a UTF-8 character. The process is still allowed to finish, so the exit code is the real one.
 
-If the command runs longer than 30000 milliseconds, the tool kills the process group and returns `{ ok: false, error: "Command timed out after 30000ms." }`. There is no exit code to show, and output from before the kill is discarded. Killing the group, not only the bash process, matters because a child such as `sleep` would otherwise keep the pipes open and the tool would wait.
+If the command runs longer than 30000 milliseconds, the tool kills the process group, destroys the output pipes, and returns `{ ok: false, error: "Command timed out after 30000ms." }` at that deadline. There is no exit code to show, and output from before the kill is discarded. Killing the group matters because a child such as `sleep` would otherwise keep running. A descendant that leaves the group, for example with `setsid`, can still hold the pipes. The tool does not wait for those pipes to close.
 
 `bash` is not jailed to the working directory. It runs with your permissions and can `cd` anywhere you can. `read_file`, `write_file`, and `edit_file` cannot. This step does not ask before it runs a command. A later step can add a permission check. There is no safety prompt here.
 

@@ -36,8 +36,9 @@ export const bashTool: Tool<BashArgs> = {
 export function runBash(command: string, cwd: string, timeoutMs = BASH_TIMEOUT_MS): Promise<ToolResult> {
   return new Promise((resolve) => {
     // detached starts a new process group so a timeout can kill the command and
-    // anything it started. Killing only bash leaves children holding the pipes,
-    // and the tool would wait until those children exit.
+    // anything still in that group. A descendant that calls setsid leaves the
+    // group and can hold the pipes open, so the timeout settles on the timer
+    // and destroys the pipes instead of waiting for close.
     const child = spawn("bash", ["-c", command], {
       cwd,
       detached: true,
@@ -80,11 +81,6 @@ export function runBash(command: string, cwd: string, timeoutMs = BASH_TIMEOUT_M
       resolve(result);
     };
 
-    timer = setTimeout(() => {
-      timedOut = true;
-      killGroup();
-    }, timeoutMs);
-
     const stdoutStream = child.stdout;
     const stderrStream = child.stderr;
     if (!stdoutStream || !stderrStream) {
@@ -93,6 +89,9 @@ export function runBash(command: string, cwd: string, timeoutMs = BASH_TIMEOUT_M
       return;
     }
 
+    // destroy() on timeout can emit error. Nothing is listening otherwise.
+    stdoutStream.on("error", () => {});
+    stderrStream.on("error", () => {});
     stdoutStream.setEncoding("utf8");
     stderrStream.setEncoding("utf8");
     stdoutStream.on("data", (chunk: string) => {
@@ -111,6 +110,15 @@ export function runBash(command: string, cwd: string, timeoutMs = BASH_TIMEOUT_M
     child.on("error", (err) => {
       finish({ ok: false, error: errorText(err) });
     });
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      killGroup();
+      stdoutStream.destroy();
+      stderrStream.destroy();
+      child.unref();
+      finish({ ok: false, error: `Command timed out after ${timeoutMs}ms.` });
+    }, timeoutMs);
 
     child.on("close", (code, signal) => {
       if (timedOut) {

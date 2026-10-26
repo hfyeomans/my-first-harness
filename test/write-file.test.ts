@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -94,6 +95,86 @@ test("returns ok: false and writes nothing for a bad path or an oversized body",
   assert.equal(big.ok, false);
   if (!big.ok) assert.match(big.error, /too large to write/);
   assert.equal(await readFile(path.join(work, "keep.txt"), "utf8"), "keep");
+});
+
+test("overwrites a write-only file", async () => {
+  const file = path.join(work, "wo.txt");
+  await writeFile(file, "old");
+  await chmod(file, 0o200);
+  assert.deepEqual(await write("wo.txt", "new"), { ok: true, output: "Wrote wo.txt" });
+  await chmod(file, 0o644);
+  assert.equal(await readFile(file, "utf8"), "new");
+});
+
+test("a failed write leaves the original file and no partial file", { timeout: 20_000 }, async () => {
+  const mount = `/tmp/tinyfs-${process.pid}-${Date.now()}`;
+  const script = path.join("/workspace", `.full-disk-${process.pid}.ts`);
+  const lines = [
+    `import { mkdir, open, readFile, readdir, rm, writeFile } from "node:fs/promises";`,
+    `import { spawnSync } from "node:child_process";`,
+    `import path from "node:path";`,
+    `import { writeText } from "/workspace/src/write-file.ts";`,
+    `const mount = ${JSON.stringify(mount)};`,
+    `await mkdir(mount, { recursive: true });`,
+    `const mounted = spawnSync("mount", ["-t", "tmpfs", "-o", "size=64k", "tmpfs", mount], { encoding: "utf8" });`,
+    `if (mounted.status !== 0) { console.error(mounted.stderr || mounted.stdout); process.exit(2); }`,
+    `try {`,
+    `  const keep = path.join(mount, "keep.txt");`,
+    `  await writeFile(keep, "original-contents\\n");`,
+    `  const pad = await open(path.join(mount, "pad"), "w");`,
+    `  const chunk = Buffer.alloc(4096, 0x61);`,
+    `  try { for (;;) await pad.write(chunk); } catch (err) { const code = err && typeof err === "object" && "code" in err ? err.code : undefined; if (code !== "ENOSPC") throw err; } finally { await pad.close(); }`,
+    `  const result = await writeText("keep.txt", "n".repeat(20000), mount);`,
+    `  const created = await writeText("fresh.txt", "new file\\n", mount);`,
+    `  const body = await readFile(keep, "utf8");`,
+    `  const names = await readdir(mount);`,
+    `  console.log(JSON.stringify({ result, created, body, names }));`,
+    `} finally {`,
+    `  spawnSync("umount", [mount]);`,
+    `  await rm(mount, { recursive: true, force: true });`,
+    `}`,
+  ];
+  await writeFile(script, lines.join("\n"));
+
+  const tsx = "/workspace/node_modules/tsx/dist/cli.mjs";
+  let output: { code: number | null; stdout: string; stderr: string };
+  try {
+    output = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn("unshare", ["--user", "--map-root-user", "--mount", process.execPath, tsx, script], {
+        cwd: "/workspace",
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+  } finally {
+    await rm(script, { force: true });
+  }
+
+  assert.equal(output.code, 0, output.stderr);
+  const parsed = JSON.parse(output.stdout) as {
+    result: { ok: boolean };
+    created: { ok: boolean };
+    body: string;
+    names: string[];
+  };
+  assert.equal(parsed.result.ok, false);
+  assert.equal(parsed.created.ok, false);
+  assert.equal(parsed.body, "original-contents\n");
+  assert.equal(parsed.names.includes("fresh.txt"), false);
+  assert.equal(
+    parsed.names.some((name) => name.startsWith(".myagent-")),
+    false,
+  );
 });
 
 test("parse rejects arguments that are not a path and contents", () => {

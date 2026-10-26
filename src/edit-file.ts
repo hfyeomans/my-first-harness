@@ -55,19 +55,21 @@ async function editFileAt(rel: string, oldString: string, newString: string, cwd
 
   const at = current.output.indexOf(oldString);
   const next = current.output.slice(0, at) + newString + current.output.slice(at + oldString.length);
-  const written = await writeText(rel, next, cwd);
+  const written = await writeText(rel, next, cwd, current.output);
   if (!written.ok) return written;
   return { ok: true, output: `Edited ${rel}` };
 }
 
 function occurrences(text: string, needle: string): number {
+  if (needle.length === 0) return 0;
   let count = 0;
   let from = 0;
   while (from <= text.length) {
     const at = text.indexOf(needle, from);
     if (at === -1) return count;
     count += 1;
-    from = at + needle.length;
+    // Step one character so `aa` inside `aaa` counts twice.
+    from = at + 1;
   }
   return count;
 }

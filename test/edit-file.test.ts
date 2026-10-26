@@ -57,6 +57,16 @@ test("leaves the file unchanged when old_string is missing or repeated", async (
   assert.equal(await readFile(file, "utf8"), "two");
 });
 
+test("refuses an overlapping match and leaves the file unchanged", async () => {
+  const file = path.join(work, "overlap.txt");
+  await writeFile(file, "aaa");
+  assert.deepEqual(await edit("overlap.txt", "aa", "b"), {
+    ok: false,
+    error: "old_string appears 2 times in overlap.txt. Include more surrounding text so it matches once.",
+  });
+  assert.equal(await readFile(file, "utf8"), "aaa");
+});
+
 test("returns the read error and does not change bytes the reader refuses", async () => {
   const nul = path.join(work, "nul.txt");
   const bytes = Buffer.from("ok\0no");

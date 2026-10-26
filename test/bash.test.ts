@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -56,6 +57,38 @@ test("kills a command that exceeds the timeout", { timeout: 5_000 }, async () =>
   assert.deepEqual(result, { ok: false, error: "Command timed out after 200ms." });
   assert.ok(Date.now() - started < 5_000);
 });
+
+test("a setsid child does not hold the tool past the timeout", { timeout: 10_000 }, async () => {
+  const marker = `myagent-hang-${process.pid}-${Date.now()}`;
+  const started = Date.now();
+  try {
+    const result = await runBash(`setsid bash -c 'exec -a ${marker} sleep 60'`, work, 300);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.error, /timed out after 300ms/);
+    assert.ok(Date.now() - started < 3_000);
+  } finally {
+    killMarker(marker);
+  }
+});
+
+function killMarker(marker: string): void {
+  let listing = "";
+  try {
+    listing = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+  } catch {
+    return;
+  }
+  for (const line of listing.split("\n")) {
+    if (!line.includes(marker)) continue;
+    const pid = Number(line.trim().split(/\s+/)[0]);
+    if (!pid || pid === process.pid) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+}
 
 test("parse rejects arguments that are not a command", () => {
   assert.throws(() => bashTool.parse({}), /Validation failed/);
