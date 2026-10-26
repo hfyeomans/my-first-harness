@@ -300,4 +300,53 @@ describe("compaction", () => {
     const resumed = await resumeSession(sessions, opened.id);
     assert.deepEqual(resumed.session.messages(), messages);
   });
+
+  test("a huge tool call argument is capped in the summary and the original stays whole", async () => {
+    const sessions = path.join(dir, "sessions-args");
+    await mkdir(sessions);
+    const window = 200;
+    const huge = "S".repeat(200_000);
+    const call = fauxToolCall(
+      "edit_file",
+      { path: "note.txt", old_string: huge, new_string: "x" },
+      { id: "edit-1" },
+    );
+    const assistant = fauxAssistantMessage([call], { stopReason: "toolUse", timestamp: 2 });
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const faux = createFauxModel({ contextWindow: window });
+    const model: AgentModel = {
+      complete: (history, tools) => faux.complete(history, tools),
+      context: {
+        window,
+        async summarize(input) {
+          const tokens = estimateContextTokens(input.replaced).tokens;
+          assert.ok(tokens <= Math.floor(window / 2));
+          const message = input.replaced.find((item) => item.role === "assistant");
+          assert.ok(message?.role === "assistant");
+          const tool = toolCallsOf(message)[0];
+          assert.equal(tool?.id, "edit-1");
+          assert.equal(tool?.name, "edit_file");
+          const oldString = String(tool?.arguments["old_string"]);
+          assert.match(oldString, /\[\.\.\. \d+ bytes elided\]/);
+          assert.ok(oldString.length < huge.length);
+          assert.equal(tool?.arguments["path"], "note.txt");
+          assert.equal(tool?.arguments["new_string"], "x");
+          return "summary of the edit";
+        },
+      },
+    };
+
+    const messages = await runAgent([assistant, user("What now?")], [], {
+      model,
+      cwd: dir,
+      session: opened.session,
+    });
+
+    assert.equal(call.arguments["old_string"], huge);
+    assert.equal(JSON.stringify(messages).includes(huge), false);
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes(huge), true);
+    const resumed = await resumeSession(sessions, opened.id);
+    assert.deepEqual(resumed.session.messages(), messages);
+  });
 });
