@@ -71,7 +71,7 @@ Pick a provider and a model id with flags or environment variables:
 | Flag | Environment variable | Meaning |
 | --- | --- | --- |
 | `--provider` | `MYAGENT_PROVIDER` | Provider id, such as `openai`, `anthropic`, or `google`. `faux` is the offline script. |
-| `--model` | `MYAGENT_MODEL` | Model id, such as `gpt-4o-mini` or `claude-haiku-4-5`. Unused for `faux`. |
+| `--model` | `MYAGENT_MODEL` | Model id, such as `gpt-4o-mini` or `claude-haiku-5-5`. Unused for `faux`. |
 | `--max-turns` | `MYAGENT_MAX_TURNS` | Maximum model calls. Default 8. |
 | `--cwd` | | Working directory for the tools. Default: where you ran the command. |
 | `-p`, `--prompt` | | The prompt. |
@@ -88,10 +88,10 @@ Other providers use the variables documented in the `@earendil-works/pi-ai` READ
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-node dist/cli.js -p "Read sample.txt and quote the first line" --provider anthropic --model claude-haiku-4-5
+node dist/cli.js -p "Read sample.txt and quote the first line" --provider anthropic --model claude-haiku-5-5
 ```
 
-`gpt-4o-mini`, `claude-haiku-4-5`, `claude-sonnet-4-5`, and `gemini-2.5-flash` are ids in the pi-ai 1.4.0 catalog.
+`gpt-4o-mini`, `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, and `gemini-2.5-flash` are ids in the pi-ai 1.4.0 catalog. Haiku, Sonnet, and Opus are pinned to 5.5. `loadPiModel` replaces an older id in one of those families with that provider's 5.5 id before the request, so `claude-haiku-4-5` is called as `claude-haiku-5-5`. A route that has no 5.5 model for the family is refused.
 
 ## How the loop works
 

@@ -15,7 +15,7 @@ const HELP = `myagent — agent loop with read_file, write_file, edit_file, and 
 Usage:
   myagent -p "Read sample.txt" --provider faux
   myagent -p 'Edit sample.txt, replace "hello" with "goodbye", and verify' --provider faux
-  myagent -p "Read sample.txt" --provider anthropic --model claude-haiku-4-5
+  myagent -p "Read sample.txt" --provider anthropic --model claude-haiku-5-5
 
 Options:
   -p, --prompt     Prompt text
