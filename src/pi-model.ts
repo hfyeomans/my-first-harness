@@ -33,12 +33,101 @@ export function piModel(models: Models, model: Model<any>): AgentModel {
   };
 }
 
+const CLAUDE_FAMILY = /\b(haiku|sonnet|opus)\b/i;
+
+/**
+ * Haiku, Sonnet, and Opus stay on 5.5. An older id is replaced with that
+ * provider's 5.5 id before the request. A route with no 5.5 model is refused.
+ */
+export function resolveCatalogModel(models: Models, provider: string, modelId: string): Model<any> {
+  const catalogIds = models.getModels(provider).map((model) => model.id);
+  const pinned = pinClaudeModelId(provider, modelId, catalogIds);
+  const found = models.getModel(provider, pinned);
+  if (!found) {
+    throw new Error(`Unknown model "${pinned}" for provider "${provider}".`);
+  }
+  return found;
+}
+
 export async function loadPiModel(provider: string, modelId: string): Promise<AgentModel> {
   const { builtinModels } = await import("@earendil-works/pi-ai/providers/all");
   const models = builtinModels();
-  const found = models.getModel(provider, modelId);
-  if (!found) {
-    throw new Error(`Unknown model "${modelId}" for provider "${provider}".`);
+  return piModel(models, resolveCatalogModel(models, provider, modelId));
+}
+
+type ClaudeFamily = "haiku" | "sonnet" | "opus";
+type ModelVariant = "batch" | "fast" | "plain";
+
+function pinClaudeModelId(provider: string, modelId: string, catalogIds: readonly string[]): string {
+  const located = familyAt(modelId);
+  if (!located) return modelId;
+  if (isPinned55(modelId, located)) return modelId;
+
+  const pins = catalogIds.filter((id) => {
+    const candidate = familyAt(id);
+    return candidate?.family === located.family && isPinned55(id, candidate);
+  });
+  if (pins.length === 0) {
+    throw new Error(
+      `Claude ${located.family} is pinned to 5.5. Refusing "${modelId}" for provider "${provider}" because that provider has no ${located.family} 5.5 model.`,
+    );
   }
-  return piModel(models, found);
+
+  const prefix = modelId.slice(0, located.index).toLowerCase();
+  const samePrefix = pins.filter((id) => {
+    const candidate = familyAt(id);
+    return candidate !== undefined && id.slice(0, candidate.index).toLowerCase() === prefix;
+  });
+  let pool: readonly string[] | undefined;
+  if (samePrefix.length > 0) pool = samePrefix;
+  else if (isFloatingAlias(modelId)) pool = pins;
+  if (!pool) {
+    throw new Error(
+      `Claude ${located.family} is pinned to 5.5. Refusing "${modelId}" for provider "${provider}" because that route has no ${located.family} 5.5 model.`,
+    );
+  }
+
+  const variant = variantOf(modelId);
+  const sameVariant = pool.filter((id) => variantOf(id) === variant);
+  const plain = pool.filter((id) => variantOf(id) === "plain");
+  if (sameVariant.length > 0) return shortest(sameVariant);
+  if (plain.length > 0) return shortest(plain);
+  return shortest(pool);
+}
+
+function familyAt(id: string): { family: ClaudeFamily; index: number } | undefined {
+  const match = CLAUDE_FAMILY.exec(id);
+  const name = match?.[1]?.toLowerCase();
+  if (!match || match.index === undefined || (name !== "haiku" && name !== "sonnet" && name !== "opus")) {
+    return undefined;
+  }
+  return { family: name, index: match.index };
+}
+
+function isPinned55(id: string, located: { family: ClaudeFamily; index: number }): boolean {
+  const rest = id.slice(located.index + located.family.length);
+  return /^[-.]5[-.]5(?!\d)/.test(rest);
+}
+
+function isFloatingAlias(id: string): boolean {
+  return id.startsWith("~") || /(?:^|[^a-z])latest(?:[^a-z]|$)/i.test(id);
+}
+
+function variantOf(id: string): ModelVariant {
+  const lower = id.toLowerCase();
+  if (/(?:[:/-])batch$/.test(lower)) return "batch";
+  if (/(?:[:/-])fast$/.test(lower)) return "fast";
+  return "plain";
+}
+
+function shortest(ids: readonly string[]): string {
+  const first = ids[0];
+  if (first === undefined) {
+    throw new Error("Claude 5.5 pin had no model to choose.");
+  }
+  let best = first;
+  for (const id of ids) {
+    if (id.length < best.length || (id.length === best.length && id < best)) best = id;
+  }
+  return best;
 }

@@ -11,9 +11,10 @@ import {
   getCurrentSystemPrompt,
   getCurrentTools,
 } from "@earendil-works/pi-ai";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { runAgent } from "../src/loop.js";
 import { finalAnswer } from "../src/messages.js";
-import { piModel, loadPiModel } from "../src/pi-model.js";
+import { piModel, loadPiModel, resolveCatalogModel } from "../src/pi-model.js";
 import { readFileTool } from "../src/read-file.js";
 import { agentTools } from "../src/registry.js";
 
@@ -94,9 +95,61 @@ test("piModel sends every registry tool as a declaration", async () => {
   assert.equal(finalAnswer(messages), "done");
 });
 
-test("claude-haiku-4-5 resolves for anthropic", async () => {
-  const model = await loadPiModel("anthropic", "claude-haiku-4-5");
+test("claude-haiku-5-5 resolves for anthropic", async () => {
+  const model = await loadPiModel("anthropic", "claude-haiku-5-5");
   assert.equal(typeof model.complete, "function");
+});
+
+test("older haiku, sonnet, and opus ids resolve to 5.5", () => {
+  const models = builtinModels();
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-haiku-4-5").id, "claude-haiku-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-haiku-4-5-20251001").id, "claude-haiku-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-sonnet-4-5").id, "claude-sonnet-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-sonnet-5").id, "claude-sonnet-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-opus-4-8").id, "claude-opus-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-opus-5").id, "claude-opus-5-5");
+  assert.equal(
+    resolveCatalogModel(models, "amazon-bedrock", "eu.anthropic.claude-opus-4-6-v1").id,
+    "eu.anthropic.claude-opus-5-5",
+  );
+  assert.equal(
+    resolveCatalogModel(models, "openrouter", "anthropic/claude-haiku-4.5:batch").id,
+    "anthropic/claude-haiku-5.5:batch",
+  );
+  assert.equal(
+    resolveCatalogModel(models, "vercel-ai-gateway", "anthropic/claude-opus-4.8-fast").id,
+    "anthropic/claude-opus-5.5-fast",
+  );
+  assert.equal(
+    resolveCatalogModel(models, "openrouter", "~anthropic/claude-sonnet-latest").id,
+    "anthropic/claude-sonnet-5.5",
+  );
+  assert.equal(resolveCatalogModel(models, "github-copilot", "claude-haiku-4.5").id, "claude-haiku-5.5");
+});
+
+test("a 5.5 id stays on 5.5", () => {
+  const models = builtinModels();
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-haiku-5-5").id, "claude-haiku-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-sonnet-5-5").id, "claude-sonnet-5-5");
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-opus-5-5").id, "claude-opus-5-5");
+  assert.equal(
+    resolveCatalogModel(models, "openrouter", "anthropic/claude-haiku-5.5:batch").id,
+    "anthropic/claude-haiku-5.5:batch",
+  );
+});
+
+test("models outside haiku, sonnet, and opus are unchanged", () => {
+  const models = builtinModels();
+  assert.equal(resolveCatalogModel(models, "anthropic", "claude-fable-5").id, "claude-fable-5");
+  assert.equal(resolveCatalogModel(models, "openai", "gpt-4o-mini").id, "gpt-4o-mini");
+});
+
+test("a route with no 5.5 model is refused", () => {
+  const models = builtinModels();
+  assert.throws(
+    () => resolveCatalogModel(models, "amazon-bedrock", "in.anthropic.claude-haiku-4-5-20251001-v1:0"),
+    /pinned to 5\.5/,
+  );
 });
 
 test("an unknown model id is rejected before any request", async () => {

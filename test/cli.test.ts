@@ -60,7 +60,7 @@ test("faux provider reads a file and prints the tool call to stderr", async () =
 test("names the anthropic API key when haiku is requested without one", async () => {
   const streams = io(process.cwd(), {});
   const code = await main(
-    ["-p", "Read sample.txt", "--provider", "anthropic", "--model", "claude-haiku-4-5"],
+    ["-p", "Read sample.txt", "--provider", "anthropic", "--model", "claude-haiku-5-5"],
     streams,
   );
   assert.equal(code, 1);
