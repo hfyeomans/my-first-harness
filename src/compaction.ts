@@ -1,7 +1,7 @@
 import { contentText, type Message } from "@earendil-works/pi-ai";
 import { estimateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import type { CompactionReason, Session, SessionEntry } from "./session.js";
-import type { ModelContext } from "./types.js";
+import type { ModelContext, SummaryInput } from "./types.js";
 
 /**
  * Before the first reply reports usage, the estimate cannot see the system
@@ -17,7 +17,9 @@ export const KEEP_RECENT_RATIO = 0.25;
  * The summary request has to fit in the same window as the conversation.
  * User text, assistant text, tool-call argument strings, and tool-result
  * text in that request are cut until the estimate is under this share.
- * The session file keeps the originals.
+ * Strings that are already short can still add up, and so can the previous
+ * summary. The copy then drops the oldest turns, or cuts that previous
+ * summary the same way. The session file keeps the originals.
  */
 const SUMMARY_INPUT_RATIO = 0.5;
 
@@ -49,32 +51,73 @@ export async function compact(session: Session, context: ModelContext, reason: C
 
   const previous = messages.length > session.entries().length ? messages[0] : undefined;
   const previousText = typeof previous?.content === "string" ? previous.content : undefined;
-  const summary = await context.summarize({
-    previous: previousText,
-    replaced: capSummaryMessages(
+  const summary = await context.summarize(
+    fitSummaryInput(
       replaced.map((entry) => entry.message),
       context.window,
       previousText,
     ),
-  });
+  );
   await session.appendCompaction({ reason, firstKept: firstKept.seq, summary });
   return true;
 }
 
-function capSummaryMessages(messages: readonly Message[], window: number, previous: string | undefined): Message[] {
+function fitSummaryInput(messages: readonly Message[], window: number, previous: string | undefined): SummaryInput {
   const budget = Math.max(1, Math.floor(window * SUMMARY_INPUT_RATIO));
-  const previousTokens =
-    previous === undefined ? 0 : estimateMessageTokens({ role: "user", content: previous, timestamp: 0 });
-  const target = Math.max(1, budget - previousTokens);
-  if (tokenSum(messages) <= target) return messages.slice();
+  const previousText =
+    previous === undefined || tokensOfText(previous) <= budget ? previous : capTextToBudget(previous, budget);
+  const target = budget - (previousText === undefined ? 0 : tokensOfText(previousText));
 
-  let cap = longestText(messages);
   let capped = messages.slice();
-  while (tokenSum(capped) > target && cap > 1) {
+  if (tokenSum(capped) > target) {
+    let cap = longestText(messages);
+    while (tokenSum(capped) > target && cap > 1) {
+      cap = Math.max(1, Math.floor(cap / 2));
+      capped = messages.map((message) => capMessage(message, cap));
+    }
+    if (tokenSum(capped) > target) capped = dropOldest(capped, target);
+  }
+  return { previous: previousText, replaced: capped };
+}
+
+function tokensOfText(text: string): number {
+  return estimateMessageTokens({ role: "user", content: text, timestamp: 0 });
+}
+
+// Halve from the original. The same cut as a long tool result or user message.
+function capTextToBudget(text: string, budget: number): string {
+  let cap = text.length;
+  let capped = text;
+  while (tokensOfText(capped) > budget && cap > 1) {
     cap = Math.max(1, Math.floor(cap / 2));
-    capped = messages.map((message) => capMessage(message, cap));
+    capped = capString(text, cap);
   }
   return capped;
+}
+
+// Drop leading turns until the copy fits. A tool result stays with the call
+// ahead of it, so the copy never starts on a result whose call was dropped.
+function dropOldest(messages: readonly Message[], target: number): Message[] {
+  let start = 0;
+  while (start <= messages.length) {
+    if (messages[start]?.role === "toolResult") {
+      start += 1;
+      continue;
+    }
+    const kept = messages.slice(start);
+    const candidate = start === 0 ? kept : [omittedNote(start), ...kept];
+    if (tokenSum(candidate) <= target) return candidate;
+    start += 1;
+  }
+  return [];
+}
+
+function omittedNote(count: number): Message {
+  return {
+    role: "user",
+    content: `[${count} earlier messages omitted from this summary input]`,
+    timestamp: 0,
+  };
 }
 
 function tokenSum(messages: readonly Message[]): number {

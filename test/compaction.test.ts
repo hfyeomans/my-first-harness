@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { contentText, fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
-import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { estimateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { createFauxModel } from "../src/faux-model.js";
 import { runAgent } from "../src/loop.js";
 import { finalAnswer, toolCallsOf, toolResultMessage } from "../src/messages.js";
@@ -15,6 +15,14 @@ import type { AgentModel, SummaryInput } from "../src/types.js";
 
 function user(content: string): Message {
   return { role: "user", content, timestamp: 1 };
+}
+
+function summaryRequestTokens(input: SummaryInput): number {
+  const previous =
+    input.previous === undefined
+      ? 0
+      : estimateMessageTokens({ role: "user", content: input.previous, timestamp: 0 });
+  return previous + input.replaced.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
 }
 
 function scripted(
@@ -63,8 +71,9 @@ describe("compaction", () => {
     await writeFile(path.join(dir, "sample.txt"), "hello from disk\n");
     const prompt = 'Edit sample.txt, replace "hello" with "goodbye", and verify';
     const seen: string[] = [];
+    // 64 leaves the summary of this prompt inside half the window on the next compaction.
     const messages = await runAgent([user(prompt)], agentTools, {
-      model: createFauxModel({ contextWindow: 40 }),
+      model: createFauxModel({ contextWindow: 64 }),
       cwd: dir,
       onToolCall: (call) => seen.push(call.name),
     });
@@ -348,5 +357,102 @@ describe("compaction", () => {
     assert.equal(file.includes(huge), true);
     const resumed = await resumeSession(sessions, opened.id);
     assert.deepEqual(resumed.session.messages(), messages);
+  });
+
+  test("thousands of tiny messages stay under the summary budget and the log keeps them", async () => {
+    const sessions = path.join(dir, "sessions-tiny");
+    await mkdir(sessions);
+    const window = 200;
+    const oldest = user("oldest-marker");
+    const droppedCall = fauxToolCall("read_file", { path: "old.txt" }, { id: "old-call" });
+    const keptCall = fauxToolCall("read_file", { path: "new.txt" }, { id: "kept-call" });
+    const history: Message[] = [
+      oldest,
+      fauxAssistantMessage([droppedCall], { stopReason: "toolUse", timestamp: 2 }),
+      toolResultMessage(droppedCall, { ok: true, output: "old" }),
+    ];
+    for (let i = 0; i < 2_000; i++) history.push(user("x"));
+    history.push(
+      fauxAssistantMessage([keptCall], { stopReason: "toolUse", timestamp: 4 }),
+      toolResultMessage(keptCall, { ok: true, output: "new" }),
+    );
+    for (let i = 0; i < 80; i++) history.push(user("y"));
+
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const { model } = scripted([fauxAssistantMessage("done")], window);
+    const wrapped: AgentModel = {
+      complete: model.complete,
+      context: {
+        window,
+        async summarize(input) {
+          assert.ok(summaryRequestTokens(input) <= Math.floor(window / 2));
+          const note = input.replaced[0];
+          assert.equal(note?.role, "user");
+          const match = /^\[(\d+) earlier messages omitted from this summary input\]$/.exec(String(note?.content));
+          assert.ok(match);
+          assert.ok(Number(match[1]) >= 1_000);
+          const callIds = input.replaced.flatMap((message) =>
+            message.role === "assistant" ? toolCallsOf(message).map((call) => call.id) : [],
+          );
+          assert.equal(callIds.includes("old-call"), false);
+          const keptIndex = input.replaced.findIndex(
+            (message) => message.role === "assistant" && toolCallsOf(message).some((call) => call.id === "kept-call"),
+          );
+          assert.ok(keptIndex >= 0);
+          const result = input.replaced[keptIndex + 1];
+          assert.ok(result?.role === "toolResult" && result.toolCallId === "kept-call");
+          for (const message of input.replaced) {
+            if (message.role === "toolResult") assert.ok(callIds.includes(message.toolCallId));
+          }
+          return "summary of the tiny messages";
+        },
+      },
+    };
+
+    const messages = await runAgent(history, [], { model: wrapped, cwd: dir, session: opened.session });
+
+    assert.equal(oldest.content, "oldest-marker");
+    assert.equal(messages[0]?.content, "summary of the tiny messages");
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes("oldest-marker"), true);
+    assert.equal(file.includes("old-call"), true);
+    assert.equal(file.includes("omitted from this summary input"), false);
+  });
+
+  test("an oversized previous summary is cut so the summary request stays under budget", async () => {
+    const sessions = path.join(dir, "sessions-previous");
+    await mkdir(sessions);
+    const window = 200;
+    const huge = "P".repeat(50_000);
+    const kept = user("seed-kept");
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    await opened.session.appendMessage(user("seed-old"));
+    await opened.session.appendMessage(kept);
+    await opened.session.appendCompaction({ reason: "threshold", firstKept: 2, summary: huge });
+
+    const { model } = scripted([fauxAssistantMessage("done")], window);
+    const wrapped: AgentModel = {
+      complete: model.complete,
+      context: {
+        window,
+        async summarize(input) {
+          assert.ok(summaryRequestTokens(input) <= Math.floor(window / 2));
+          assert.match(input.previous ?? "", /\[\.\.\. \d+ bytes elided\]/);
+          assert.ok((input.previous ?? "").length < huge.length);
+          return "summary after the previous one";
+        },
+      },
+    };
+
+    const messages = await runAgent(
+      Array.from({ length: 80 }, () => user("q")),
+      [],
+      { model: wrapped, cwd: dir, session: opened.session },
+    );
+
+    assert.equal(kept.content, "seed-kept");
+    assert.equal(messages[0]?.content, "summary after the previous one");
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes(huge), true);
   });
 });
