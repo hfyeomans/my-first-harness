@@ -1,5 +1,28 @@
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Message, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ToolResult } from "./types.js";
+
+export type ReplyCheck = { ok: true } | { ok: false; overflow: boolean; error: string };
+
+/**
+ * Overflow is checked first because a zero-output `length` stop can be an
+ * overflow, and the `length` rule would hide it. Pass the real window, or that
+ * case and silent overflow go undetected.
+ */
+export function classifyReply(message: AssistantMessage, contextWindow: number | undefined): ReplyCheck {
+  if (isContextOverflow(message, contextWindow)) {
+    return { ok: false, overflow: true, error: "The conversation does not fit in the model's context window." };
+  }
+  if (message.stopReason === "stop" || message.stopReason === "toolUse") return { ok: true };
+  if (message.stopReason === "length") {
+    return { ok: false, overflow: false, error: "The model stopped because it hit its output limit." };
+  }
+  return {
+    ok: false,
+    overflow: false,
+    error: message.errorMessage || `Model stopped (${message.stopReason}).`,
+  };
+}
 
 export function toolCallsOf(message: AssistantMessage): ToolCall[] {
   const calls: ToolCall[] = [];

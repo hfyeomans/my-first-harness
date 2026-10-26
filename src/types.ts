@@ -33,7 +33,25 @@ export interface Tool<A> {
  * One model turn. `piModel` calls pi-ai. Tests pass a script instead.
  * The history uses pi-ai's `Message` so an assistant reply can be sent back
  * unchanged on the next turn (thinking blocks and provider metadata included).
+ *
+ * `complete` returns the provider's reply as it came, including `error`,
+ * `aborted`, and `length` stops. The loop decides what the reply means.
+ * Without `context` the loop never compacts.
  */
 export interface AgentModel {
   complete(history: readonly Message[], tools: readonly Tool<any>[]): Promise<AssistantMessage>;
+  context?: ModelContext;
+}
+
+export interface ModelContext {
+  /** Tokens per request. For pi-ai models this is `Model.contextWindow`. */
+  window: number;
+  /** One model call with no tools. The text replaces `previous` and `replaced`. */
+  summarize(input: SummaryInput): Promise<string>;
+}
+
+export interface SummaryInput {
+  previous: string | undefined;
+  /** Oldest first, in whole groups, so every tool result's call is here too. */
+  replaced: readonly Message[];
 }
