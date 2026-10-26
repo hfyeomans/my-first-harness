@@ -2,7 +2,7 @@
   "name": "my-first-harness",
   "version": "0.1.0",
   "private": true,
-  "description": "Step 2 of a small coding-agent harness: a tool registry plus write_file, edit_file, and bash.",
+  "description": "Step 3 of a small coding-agent harness: sessions you can resume, and compaction.",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -91,6 +92,118 @@ test("faux provider reads, edits, and verifies with bash", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a run prints its session id to stderr and --resume continues it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-resume-"));
+  try {
+    await writeFile(path.join(dir, "sample.txt"), "hello from disk\n");
+    const first = io(dir);
+    assert.equal(await main(["-p", "Read sample.txt", "--provider", "faux", "--cwd", dir], first), 0);
+    const id = first.err().match(/^session (\S+)$/m)?.[1];
+    assert.ok(id, first.err());
+    assert.ok(existsSync(path.join(dir, ".myagent", "sessions", `${id}.jsonl`)));
+    assert.equal(first.out(), "The file says:\nhello from disk\n");
+
+    const bare = io(dir);
+    const code = await main(["-p", "What did I ask before?", "--provider", "faux", "--cwd", dir, "--resume"], bare);
+    assert.equal(code, 0, bare.err());
+    assert.match(bare.err(), new RegExp(`^session ${id}$`, "m"));
+    assert.equal(bare.out(), "Earlier you asked: Read sample.txt\n");
+
+    const named = io(dir);
+    assert.equal(await main(["--resume", id, "-p", "And now?", "--provider", "faux", "--cwd", dir], named), 0);
+    assert.equal(named.out(), "Earlier you asked: What did I ask before?\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--resume warns on stderr about a truncated last line and still answers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-torn-"));
+  try {
+    await writeFile(path.join(dir, "sample.txt"), "hello from disk\n");
+    const first = io(dir);
+    assert.equal(await main(["-p", "Read sample.txt", "--provider", "faux", "--cwd", dir], first), 0);
+    const id = first.err().match(/^session (\S+)$/m)?.[1] ?? "";
+    await appendFile(path.join(dir, ".myagent", "sessions", `${id}.jsonl`), '{"type":"mess');
+
+    const resumed = io(dir);
+    const code = await main(["--resume", "-p", "What did I ask before?", "--provider", "faux", "--cwd", dir], resumed);
+    assert.equal(code, 0, resumed.err());
+    assert.match(resumed.err(), /was incomplete and was dropped/);
+    assert.equal(resumed.out(), "Earlier you asked: Read sample.txt\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--resume with ../ does not read outside the sessions directory", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-escape-"));
+  try {
+    const sessions = path.join(dir, "sessions");
+    const outside = path.join(dir, "20261026-000000-abcdef.jsonl");
+    const header = `${JSON.stringify({ type: "session", version: 1, id: "20261026-000000-abcdef", created_at: "", provider: "faux", model: "", cwd: dir })}\n`;
+    await writeFile(outside, header);
+    const streams = io(dir);
+    const code = await main(
+      ["-p", "hi", "--provider", "faux", "--sessions-dir", sessions, "--resume", "../20261026-000000-abcdef"],
+      streams,
+    );
+    assert.equal(code, 1);
+    assert.match(streams.err(), /--resume: "\.\.\/20261026-000000-abcdef" is not a session id\./);
+    assert.equal(streams.out(), "");
+    assert.equal(await readFile(outside, "utf8"), header);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--resume with no sessions says how to start one", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-none-"));
+  try {
+    const streams = io(dir);
+    const code = await main(["-p", "hi", "--provider", "faux", "--cwd", dir, "--resume"], streams);
+    assert.equal(code, 1);
+    assert.match(streams.err(), /No sessions in .*\. Run without --resume to start one\./);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--sessions-dir and MYAGENT_SESSIONS_DIR resolve against where the command ran", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-dir-"));
+  try {
+    const work = path.join(dir, "work");
+    await mkdir(work);
+    await writeFile(path.join(work, "sample.txt"), "hello\n");
+
+    const flag = io(dir);
+    assert.equal(await main(["-p", "Read sample.txt", "--provider", "faux", "--cwd", work, "--sessions-dir", "store"], flag), 0);
+    const flagId = flag.err().match(/^session (\S+)$/m)?.[1];
+    assert.ok(existsSync(path.join(dir, "store", `${flagId}.jsonl`)));
+
+    const env = io(dir, { MYAGENT_SESSIONS_DIR: "from-env" });
+    assert.equal(await main(["-p", "Read sample.txt", "--provider", "faux", "--cwd", work], env), 0);
+    const envId = env.err().match(/^session (\S+)$/m)?.[1];
+    assert.ok(existsSync(path.join(dir, "from-env", `${envId}.jsonl`)));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--faux-context-window needs --provider faux and a positive integer", async () => {
+  const other = io(process.cwd(), { OPENAI_API_KEY: "sk-test" });
+  const code = await main(
+    ["-p", "hi", "--provider", "openai", "--model", "gpt-4o-mini", "--faux-context-window", "40"],
+    other,
+  );
+  assert.equal(code, 1);
+  assert.match(other.err(), /--faux-context-window only works with --provider faux/);
+
+  const zero = io(process.cwd());
+  assert.equal(await main(["-p", "hi", "--provider", "faux", "--faux-context-window", "0"], zero), 1);
+  assert.match(zero.err(), /--faux-context-window must be a positive integer, got "0"/);
 });
 
 test("a piped answer larger than the pipe buffer is delivered whole", { timeout: 20_000 }, async () => {

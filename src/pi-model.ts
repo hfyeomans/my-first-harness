@@ -1,6 +1,7 @@
-import type { AssistantMessage, Message, Model, Models } from "@earendil-works/pi-ai";
+import { contentText, type Message, type Model, type Models } from "@earendil-works/pi-ai";
+import { assistantText, classifyReply } from "./messages.js";
 import { toolDeclarations } from "./registry.js";
-import type { AgentModel, Tool } from "./types.js";
+import type { AgentModel, SummaryInput } from "./types.js";
 
 const SYSTEM_PROMPT = [
   "You are a coding agent.",
@@ -11,26 +12,64 @@ const SYSTEM_PROMPT = [
   "When you have what you need, answer in plain text and stop calling tools.",
 ].join(" ");
 
+const SUMMARY_SYSTEM_PROMPT = [
+  "You summarize the earlier part of a coding agent's conversation so the agent can continue with less context.",
+  "Keep the user's requests word for word.",
+  "List the files read or changed and the commands run, with their outcomes.",
+  "Say what is left to do.",
+  "Do not call tools. Answer with the summary only.",
+].join(" ");
+
 /** Adapt pi-ai's `Models.complete` to the loop's `AgentModel`. */
 export function piModel(models: Models, model: Model<any>): AgentModel {
   return {
-    async complete(history: readonly Message[], tools: readonly Tool<any>[]): Promise<AssistantMessage> {
-      const assistant = await models.complete(model, {
+    complete(history, tools) {
+      return models.complete(model, {
         systemPrompt: SYSTEM_PROMPT,
         messages: [...history],
         tools: toolDeclarations(tools),
       });
-      if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
-        throw new Error(assistant.errorMessage || `Model stopped (${assistant.stopReason}).`);
-      }
-      // "length" means the provider cut the reply off at its output limit. Text
-      // with no tool call would otherwise look like a finished answer.
-      if (assistant.stopReason === "length") {
-        throw new Error("The model stopped because it hit its output limit.");
-      }
-      return assistant;
+    },
+    context: {
+      window: model.contextWindow,
+      async summarize(input) {
+        const reply = await models.complete(model, {
+          systemPrompt: SUMMARY_SYSTEM_PROMPT,
+          messages: [{ role: "user", content: summaryPrompt(input), timestamp: Date.now() }],
+        });
+        const check = classifyReply(reply, model.contextWindow);
+        if (!check.ok) throw new Error(`Compaction failed. ${check.error}`);
+        const summary = assistantText(reply).trim();
+        if (summary === "") throw new Error("Compaction failed. The summary was empty.");
+        return summary;
+      },
     },
   };
+}
+
+function summaryPrompt({ previous, replaced }: SummaryInput): string {
+  const lines = previous === undefined ? [] : ["Summary so far:", previous, ""];
+  lines.push("Messages to fold into the summary:");
+  for (const message of replaced) lines.push(transcriptLine(message));
+  return lines.join("\n");
+}
+
+function transcriptLine(message: Message): string {
+  switch (message.role) {
+    case "system":
+    case "user":
+      return `[${message.role}] ${contentText(message.content)}`;
+    case "assistant":
+      return message.content
+        .flatMap((block) => {
+          if (block.type === "text") return [`[assistant] ${block.text}`];
+          if (block.type === "toolCall") return [`[tool call ${block.name}] ${JSON.stringify(block.arguments)}`];
+          return [];
+        })
+        .join("\n");
+    case "toolResult":
+      return `[tool ${message.isError ? "error" : "result"} ${message.toolName}] ${contentText(message.content)}`;
+  }
 }
 
 export async function loadPiModel(provider: string, modelId: string): Promise<AgentModel> {

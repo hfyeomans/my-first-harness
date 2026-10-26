@@ -2,13 +2,13 @@
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
-import type { Message } from "@earendil-works/pi-ai";
 import { missingApiKey } from "./api-key.js";
 import { createFauxModel } from "./faux-model.js";
 import { DEFAULT_MAX_TURNS, runAgent } from "./loop.js";
 import { finalAnswer } from "./messages.js";
 import { loadPiModel } from "./pi-model.js";
 import { agentTools } from "./registry.js";
+import { createSession, parseSessionId, resumeSession, SESSIONS_SUBDIR } from "./session.js";
 
 const HELP = `myagent — agent loop with read_file, write_file, edit_file, and bash
 
@@ -16,14 +16,20 @@ Usage:
   myagent -p "Read sample.txt" --provider faux
   myagent -p 'Edit sample.txt, replace "hello" with "goodbye", and verify' --provider faux
   myagent -p "Read sample.txt" --provider anthropic --model claude-haiku-4-5
+  myagent --resume -p "What did I ask before?" --provider faux
 
 Options:
-  -p, --prompt     Prompt text
-      --provider   Provider id, or "faux" for an offline scripted model
-                   (env: MYAGENT_PROVIDER)
-      --model      Model id (env: MYAGENT_MODEL). Unused for faux.
-      --max-turns  Maximum model calls (default ${DEFAULT_MAX_TURNS}, env: MYAGENT_MAX_TURNS)
-      --cwd        Working directory for the tools
+  -p, --prompt               Prompt text
+      --provider             Provider id, or "faux" for an offline scripted model
+                             (env: MYAGENT_PROVIDER)
+      --model                Model id (env: MYAGENT_MODEL). Unused for faux.
+      --max-turns            Maximum model replies (default ${DEFAULT_MAX_TURNS}, env: MYAGENT_MAX_TURNS)
+      --cwd                  Working directory for the tools
+      --resume [id]          Continue a session. With no id, the most recent one.
+      --sessions-dir         Where sessions are saved (env: MYAGENT_SESSIONS_DIR).
+                             Default: ${SESSIONS_SUBDIR} in the working directory.
+      --faux-context-window  Context window in tokens for --provider faux, so
+                             compaction can run offline
   -h, --help
 
 The API key is that provider's own environment variable, read by
@@ -47,17 +53,23 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
     model?: string;
     "max-turns"?: string;
     cwd?: string;
+    resume?: string;
+    "sessions-dir"?: string;
+    "faux-context-window"?: string;
     help?: boolean;
   };
   try {
     const parsed = parseArgs({
-      args: argv,
+      args: withBareResume(argv),
       options: {
         prompt: { type: "string", short: "p" },
         provider: { type: "string" },
         model: { type: "string" },
         "max-turns": { type: "string" },
         cwd: { type: "string" },
+        resume: { type: "string" },
+        "sessions-dir": { type: "string" },
+        "faux-context-window": { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -93,10 +105,18 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
   }
 
   let maxTurns: number;
+  let fauxWindow: number | undefined;
   try {
     maxTurns = parseMaxTurns(values["max-turns"] ?? io.env.MYAGENT_MAX_TURNS);
+    fauxWindow = parseFauxWindow(values["faux-context-window"], provider);
   } catch (err) {
     io.stderr(`${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+
+  const resumeId = values.resume ? parseSessionId(values.resume) : undefined;
+  if (values.resume && !resumeId) {
+    io.stderr(`--resume: "${values.resume}" is not a session id.\n`);
     return 1;
   }
 
@@ -109,15 +129,27 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
   }
 
   const cwd = path.resolve(values.cwd ?? io.cwd);
-  const history: Message[] = [{ role: "user", content: prompt, timestamp: Date.now() }];
+  const sessionsFlag = values["sessions-dir"] ?? io.env.MYAGENT_SESSIONS_DIR;
+  const sessionsDir = sessionsFlag ? path.resolve(io.cwd, sessionsFlag) : path.join(cwd, SESSIONS_SUBDIR);
 
   try {
+    // Before the session opens, so an unknown model id leaves no session file.
     const model =
-      provider === "faux" ? createFauxModel() : await loadPiModel(provider, modelId ?? "");
-    const messages = await runAgent(history, agentTools, {
+      provider === "faux"
+        ? createFauxModel({ contextWindow: fauxWindow })
+        : await loadPiModel(provider, modelId ?? "");
+    const opened =
+      values.resume === undefined
+        ? await createSession(sessionsDir, { provider, model: modelId ?? "faux", cwd })
+        : await resumeSession(sessionsDir, resumeId);
+    if (opened.warning) io.stderr(`${opened.warning}\n`);
+    io.stderr(`session ${opened.id}\n`);
+
+    const messages = await runAgent([{ role: "user", content: prompt, timestamp: Date.now() }], agentTools, {
       model,
       maxTurns,
       cwd,
+      session: opened.session,
       onToolCall(call) {
         io.stderr(`tool ${call.name} ${JSON.stringify(call.arguments)}\n`);
       },
@@ -141,6 +173,26 @@ function parseMaxTurns(raw: string | undefined): number {
     throw new Error(`--max-turns must be a positive integer, got "${raw}".`);
   }
   return Number(raw);
+}
+
+function parseFauxWindow(raw: string | undefined, provider: string): number | undefined {
+  if (raw === undefined) return undefined;
+  if (provider !== "faux") throw new Error("--faux-context-window only works with --provider faux.");
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error(`--faux-context-window must be a positive integer, got "${raw}".`);
+  }
+  return Number(raw);
+}
+
+// Strict parseArgs throws on a string option with no value. `--resume=` parses
+// as "", which means the most recent session.
+function withBareResume(argv: readonly string[]): string[] {
+  const end = argv.indexOf("--");
+  return argv.map((arg, index) => {
+    if (arg !== "--resume" || (end !== -1 && index > end)) return arg;
+    const next = argv[index + 1];
+    return next === undefined || next.startsWith("-") ? "--resume=" : arg;
+  });
 }
 
 function isDirectRun(): boolean {

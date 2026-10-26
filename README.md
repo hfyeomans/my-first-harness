@@ -1,6 +1,6 @@
 # my-first-harness
 
-A small coding agent you can read in one sitting. The loop is `runAgent` in `src/loop.ts`. Model calls go through `@earendil-works/pi-ai`. This step adds a tool registry and three tools that change the workspace: `write_file`, `edit_file`, and `bash`. `read_file` is still there.
+A small coding agent you can read in one sitting. The loop is `runAgent` in `src/loop.ts`. Model calls go through `@earendil-works/pi-ai`. The tools are `read_file`, `write_file`, `edit_file`, and `bash`. This step saves every run as a session you can resume, and compacts a long conversation so it fits the model's context window.
 
 `@earendil-works/pi-ai` is the published name of the `packages/ai` package from [pi](https://github.com/earendil-works/pi). This repo was written against version 1.4.0.
 
@@ -20,7 +20,7 @@ pnpm build
 
 Tool calls are printed to stderr, so you can watch the loop. The final answer is printed to stdout.
 
-Offline, with no API key, `--provider faux` is a scripted stand-in (`createFauxModel` in `src/faux-model.ts`). It is not a model. With no edit in the prompt, it takes the first filename, calls `read_file`, and prints what the tool returned:
+Offline, with no API key, `--provider faux` is a scripted stand-in (`createFauxModel` in `src/faux-model.ts`). It is not a model. It reads the newest prompt and the newest message, never a step counter. With no edit in the prompt, it takes the filename, calls `read_file`, and prints what the tool returned:
 
 ```bash
 printf 'hello from disk\n' > sample.txt
@@ -30,12 +30,13 @@ pnpm exec tsx src/cli.ts -p "Read sample.txt" --provider faux
 In a terminal that mixes the two streams, that looks like:
 
 ```
+session 20261026-140720-f951f2
 tool read_file {"path":"sample.txt"}
 The file says:
 hello from disk
 ```
 
-The `tool` line is stderr. The answer is stdout.
+The `session` and `tool` lines are stderr. The answer is stdout.
 
 If the prompt contains `replace "..." with "..."`, the same script reads the file, calls `edit_file`, then runs `grep` to check the new text:
 
@@ -44,6 +45,7 @@ pnpm exec tsx src/cli.ts -p 'Edit sample.txt, replace "hello" with "goodbye", an
 ```
 
 ```
+session 20261026-140721-9c04be
 tool read_file {"path":"sample.txt"}
 tool edit_file {"path":"sample.txt","old_string":"hello","new_string":"goodbye"}
 tool bash {"command":"grep -F -n -- 'goodbye' 'sample.txt'"}
@@ -54,7 +56,7 @@ stdout:
 stderr:
 ```
 
-That overwrites `sample.txt`. The three `tool` lines are stderr. The rest is stdout.
+That overwrites `sample.txt`. The `session` line and the three `tool` lines are stderr. The rest is stdout.
 
 After `pnpm build`, the compiled CLI is the same program:
 
@@ -72,9 +74,12 @@ Pick a provider and a model id with flags or environment variables:
 | --- | --- | --- |
 | `--provider` | `MYAGENT_PROVIDER` | Provider id, such as `openai`, `anthropic`, or `google`. `faux` is the offline script. |
 | `--model` | `MYAGENT_MODEL` | Model id, such as `gpt-4o-mini` or `claude-haiku-4-5`. Unused for `faux`. |
-| `--max-turns` | `MYAGENT_MAX_TURNS` | Maximum model calls. Default 8. |
+| `--max-turns` | `MYAGENT_MAX_TURNS` | Maximum accepted model replies. Default 8. |
 | `--cwd` | | Working directory for the tools. Default: where you ran the command. |
 | `-p`, `--prompt` | | The prompt. |
+| `--resume [id]` | | Continue a saved session with this prompt. With no id, the session written to most recently. |
+| `--sessions-dir` | `MYAGENT_SESSIONS_DIR` | Where sessions are saved. Default: `.myagent/sessions` in the working directory. |
+| `--faux-context-window` | | A context window in tokens for `--provider faux`, so compaction can run offline. Only with `faux`. |
 
 The API key is the provider's own variable. pi-ai reads it. This program does not have a separate key variable.
 
@@ -97,12 +102,65 @@ node dist/cli.js -p "Read sample.txt and quote the first line" --provider anthro
 
 Start at `runAgent` in `src/loop.ts`.
 
-1. It copies the history and calls `model.complete`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the declarations from `toolDeclarations` and a short system prompt. The prompt names the four tools, says that a non-zero bash exit is a result, and says that bash runs with the user's permissions. The CLI passes `agentTools` from `src/registry.ts`. A test can pass a different list.
-2. The assistant message comes back as pi-ai sent it. `toolCallsOf` (`src/messages.ts`) collects content blocks whose `type` is `"toolCall"`.
+1. It appends the history to the session, compacts if the session is getting too big (see [Compaction](#compaction)), and calls `model.complete` with `session.messages()`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the declarations from `toolDeclarations` and a short system prompt. The prompt names the four tools, says that a non-zero bash exit is a result, and says that bash runs with the user's permissions. The CLI passes `agentTools` from `src/registry.ts`. A test can pass a different list.
+2. The assistant message comes back as pi-ai sent it. `classifyReply` (`src/messages.ts`) decides what it means. `stop` and `toolUse` are accepted and appended. A context overflow is retried once after compacting. Any other stop throws. A `length` stop throws `The model stopped because it hit its output limit.` An error throws the provider's message. A refused reply is never appended. `toolCallsOf` collects content blocks whose `type` is `"toolCall"`.
 3. When there are no tool calls, `runAgent` returns. That assistant text is the answer. `finalAnswer` finds it, and `main` writes it to stdout.
 4. When there are tool calls, `main`'s `onToolCall` writes a `tool <name> <json>` line to stderr. Then the private `executeTool` calls `findTool`. An unknown name becomes `{ ok: false, error }`. Otherwise it calls `parse` and `run`. If either throws, that error is also `{ ok: false }`. The loop keeps going.
-5. `toolResultMessage` is the only conversion. It turns our `ToolResult` into a pi-ai message with `role: "toolResult"`, `toolCallId`, `toolName`, and `isError`. That message is appended, and the loop calls the model again with the whole transcript.
-6. Each model call counts as one turn. `DEFAULT_MAX_TURNS` is 8. Tool calls from the last allowed call still run, and then `runAgent` returns without another model call. `finalAnswer` is undefined in that case, and `main` exits with status 1 and writes `stopped after N model turns` to stderr.
+5. `toolResultMessage` is the only conversion. It turns our `ToolResult` into a pi-ai message with `role: "toolResult"`, `toolCallId`, `toolName`, and `isError`. That message is appended, and the loop calls the model again with what the session holds.
+6. Each accepted reply counts as one turn. Summary calls and a reply refused as too long do not. `DEFAULT_MAX_TURNS` is 8. Tool calls from the last allowed reply still run, and then `runAgent` returns without another model call. `finalAnswer` is undefined in that case, and `main` exits with status 1 and writes `stopped after N model turns` to stderr.
+
+## Sessions
+
+Every run is saved. `myagent` appends each message to `.myagent/sessions/<id>.jsonl` under the working directory as soon as the message exists, one JSON record per line. The directory is created mode `0700` and each new file mode `0600`, because the lines hold tool output. The session id goes to stderr before the model runs.
+
+To continue a session, pass its id to `--resume` with a new prompt. `--resume` with no id continues the session written to most recently, by file modification time. The model sees the earlier conversation. With no filename in the prompt, the faux script answers by quoting the prompt before it:
+
+```bash
+pnpm exec tsx src/cli.ts --resume -p "What did I ask before?" --provider faux
+```
+
+```
+session 20261026-140720-f951f2
+Earlier you asked: Read sample.txt
+```
+
+`--sessions-dir` or `MYAGENT_SESSIONS_DIR` keeps sessions somewhere else. A relative path there resolves against where you ran the command, not against `--cwd`. An id has to look like the ones `myagent` prints, so `--resume ../x` is refused before any file is opened.
+
+Line 1 of a session file is a header with the id, `created_at`, provider, model, and cwd. Each message record holds pi-ai's `Message` unchanged, with a `seq` that starts at 1 and goes up by one. `src/session.ts` is the only code that reads or writes these lines. The loop and the compaction code call `appendMessage` and `appendCompaction` on a `Session` and read `messages()` and `entries()` back.
+
+If the process died while writing, the last line can be incomplete. `--resume` drops that line, cuts it off the file, prints a warning to stderr, and continues. A last line that is complete but missing its newline is kept. Any other line that does not parse, or a `seq` that skips or repeats, stops `--resume` with `<file>:<line>: <reason>`. Skipping such a line could lose a tool result or a compaction.
+
+`runAgent` takes the session as `options.session`. Without one it uses an empty session that writes nothing. Either way it returns `session.messages()` as a new array and leaves the caller's array alone.
+
+### Compaction
+
+Before each model call, the loop estimates the conversation's size with pi-ai's `estimateContextTokens`. When the estimate passes `COMPACT_AT_RATIO` (75%) of the model's context window, the loop asks the model to summarize the older messages and replaces them with that summary. The window is `Model.contextWindow` from the pi-ai catalog. Nothing in the loop names a size. The ratios live in `src/compaction.ts`.
+
+The most recent messages stay word for word. An assistant message and the tool results after it form one group, and only whole groups are summarized, so a tool call is never split from its results. The newest group is always kept. Older groups are kept while they fit in `KEEP_RECENT_RATIO` (25%) of the window.
+
+The summary is a separate model call with its own prompt and no tools. It becomes a user message at the front of the history, so after a compaction `runAgent` returns a history that starts with the summary. The session file keeps every original line. Compaction appends one `compaction` record holding the summary and the `seq` where the kept messages start. `--resume` rebuilds the history from the newest one.
+
+User text, assistant text, tool-call argument strings, and tool-result text in that summary request are cut to a head and a tail, marked `[... N bytes elided]`. Thinking blocks are left out of that copy. If the copy is still over half the window, the oldest turns are left out of it and one line counts them. The newest of those turns stays. A previous summary is cut to at most half of that summary budget, so the replaced turns keep the other half. If the newest replaced turn still does not fit, compaction writes nothing. The session line keeps the full text. Tool call ids and names are left as they are.
+
+If the provider still says the request is too long (pi-ai's `isContextOverflow`), the loop compacts again, keeping only the newest group, and retries that call once. If there is nothing older to summarize, or the retry is too long as well, the run fails with `The conversation does not fit in the model's context window.`
+
+The faux script has no real window. `--faux-context-window` gives it one so you can watch compaction offline. Its summary is the earlier prompt plus a count:
+
+```bash
+head -c 2000 /dev/zero | tr '\0' x > big.txt
+pnpm exec tsx src/cli.ts -p "Read big.txt" --provider faux --faux-context-window 40
+pnpm exec tsx src/cli.ts --resume -p "What did I ask before?" --provider faux --faux-context-window 40
+```
+
+The second command prints:
+
+```
+session 20261026-140720-01df4a
+Earlier you asked: Read big.txt
+(faux summary of 3 earlier messages)
+```
+
+The answer quotes the summary. After compaction, the summary is the earlier message the model can see.
 
 ## The tool registry
 
@@ -168,6 +226,6 @@ pi-ai's shapes, and the sketch they replace:
 | `{ role: "assistant", text, toolCalls }` | `{ role: "assistant", content }`. Text and tool calls are content blocks. A tool call has `arguments`, not `args`. |
 | `{ role: "tool", callId, result }` | `{ role: "toolResult", toolCallId, toolName, content, isError }`. Our `ToolResult` (`{ ok: true, output }` or `{ ok: false, error }`) is converted by `toolResultMessage`. |
 | `Tool.schema: JSONSchema` | `Tool.parameters`, a TypeBox schema, which is what pi-ai's `Tool` and `validateToolArguments` take. |
-| `runAgent(history, tools)` | `runAgent(history, tools, options)`. `options.model` is required because the loop does not pick a provider itself. `options.maxTurns`, `options.cwd`, and `options.onToolCall` live there too. The CLI passes `agentTools`. |
+| `runAgent(history, tools)` | `runAgent(history, tools, options)`. `options.model` is required because the loop does not pick a provider itself. `options.maxTurns`, `options.cwd`, `options.onToolCall`, and `options.session` live there too. The CLI passes `agentTools`. |
 
 `ToolContext` is `{ cwd: string }`.

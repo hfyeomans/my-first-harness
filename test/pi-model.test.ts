@@ -94,6 +94,46 @@ test("piModel sends every registry tool as a declaration", async () => {
   assert.equal(finalAnswer(messages), "done");
 });
 
+test("piModel compacts at its context window with a summary call that offers no tools", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-pi-compact-"));
+  try {
+    await writeFile(path.join(dir, "note.txt"), "n".repeat(2_000));
+    const faux = fauxProvider({ models: [{ id: "small", contextWindow: 1_000 }] });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = faux.getModel();
+
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read_file", { path: "note.txt" }, { id: "call-1" })], {
+        stopReason: "toolUse",
+      }),
+      (context) => {
+        assert.deepEqual(getCurrentTools(context.messages), []);
+        const request = context.messages.at(-1);
+        assert.ok(request?.role === "user" && typeof request.content === "string");
+        assert.match(request.content, /Read note\.txt/);
+        return fauxAssistantMessage("The user asked to read note.txt.");
+      },
+      (context) => {
+        assert.ok(getCurrentTools(context.messages).some((tool) => tool.name === "read_file"));
+        return fauxAssistantMessage("the note is all n");
+      },
+    ]);
+
+    const messages = await runAgent(
+      [{ role: "user", content: "Read note.txt", timestamp: 1 }],
+      [readFileTool],
+      { model: piModel(models, model), cwd: dir },
+    );
+
+    assert.equal(faux.state.callCount, 3);
+    assert.equal(messages[0]?.content, "The user asked to read note.txt.");
+    assert.equal(finalAnswer(messages), "the note is all n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("claude-haiku-4-5 resolves for anthropic", async () => {
   const model = await loadPiModel("anthropic", "claude-haiku-4-5");
   assert.equal(typeof model.complete, "function");
