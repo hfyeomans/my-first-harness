@@ -15,8 +15,9 @@ export const KEEP_RECENT_RATIO = 0.25;
 
 /**
  * The summary request has to fit in the same window as the conversation.
- * User text, assistant text, and tool-result text in that request are cut
- * until the estimate is under this share. The session file keeps the originals.
+ * User text, assistant text, tool-call argument strings, and tool-result
+ * text in that request are cut until the estimate is under this share.
+ * The session file keeps the originals.
  */
 const SUMMARY_INPUT_RATIO = 0.5;
 
@@ -95,7 +96,11 @@ function textLengths(message: Message): number[] {
     case "toolResult":
       return [contentText(message.content).length];
     case "assistant":
-      return message.content.flatMap((block) => (block.type === "text" ? [block.text.length] : []));
+      return message.content.flatMap((block) => {
+        if (block.type === "text") return [block.text.length];
+        if (block.type === "toolCall") return leafLengths(block.arguments);
+        return [];
+      });
     case "user":
       if (typeof message.content === "string") return [message.content.length];
       return message.content.flatMap((block) => (block.type === "text" ? [block.text.length] : []));
@@ -104,38 +109,82 @@ function textLengths(message: Message): number[] {
   }
 }
 
+function leafLengths(value: unknown): number[] {
+  if (typeof value === "string") return [value.length];
+  if (Array.isArray(value)) return value.flatMap(leafLengths);
+  if (isPlain(value)) return Object.values(value).flatMap(leafLengths);
+  return [];
+}
+
 function capMessage(message: Message, maxChars: number): Message {
   switch (message.role) {
     case "toolResult": {
       const text = contentText(message.content);
-      if (text.length <= maxChars) return message;
-      return { ...message, content: [{ type: "text", text: elideMiddle(text, maxChars) }] };
+      const capped = capString(text, maxChars);
+      if (capped === text) return message;
+      return { ...message, content: [{ type: "text", text: capped }] };
     }
     case "assistant":
       return {
         ...message,
-        content: message.content.map((block) =>
-          block.type === "text" && block.text.length > maxChars
-            ? { ...block, text: elideMiddle(block.text, maxChars) }
-            : block,
-        ),
+        content: message.content.map((block) => {
+          if (block.type === "text") {
+            const text = capString(block.text, maxChars);
+            return text === block.text ? block : { ...block, text };
+          }
+          if (block.type !== "toolCall") return block;
+          const args = capLeaves(block.arguments, maxChars);
+          return args === block.arguments ? block : { ...block, arguments: args as typeof block.arguments };
+        }),
       };
     case "user":
       if (typeof message.content === "string") {
-        if (message.content.length <= maxChars) return message;
-        return { ...message, content: elideMiddle(message.content, maxChars) };
+        const text = capString(message.content, maxChars);
+        return text === message.content ? message : { ...message, content: text };
       }
       return {
         ...message,
-        content: message.content.map((block) =>
-          block.type === "text" && block.text.length > maxChars
-            ? { ...block, text: elideMiddle(block.text, maxChars) }
-            : block,
-        ),
+        content: message.content.map((block) => {
+          if (block.type !== "text") return block;
+          const text = capString(block.text, maxChars);
+          return text === block.text ? block : { ...block, text };
+        }),
       };
     default:
       return message;
   }
+}
+
+function capString(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return elideMiddle(text, maxChars);
+}
+
+// Copies plain objects and arrays. Ids and names are not passed through here.
+function capLeaves(value: unknown, maxChars: number): unknown {
+  if (typeof value === "string") return capString(value, maxChars);
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const capped = capLeaves(item, maxChars);
+      if (capped !== item) changed = true;
+      return capped;
+    });
+    return changed ? next : value;
+  }
+  if (!isPlain(value)) return value;
+  let changed = false;
+  const copy: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    const capped = capLeaves(child, maxChars);
+    if (capped !== child) changed = true;
+    copy[key] = capped;
+  }
+  return changed ? copy : value;
+}
+
+function isPlain(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function elideMiddle(text: string, maxChars: number): string {

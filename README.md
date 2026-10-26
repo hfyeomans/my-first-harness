@@ -140,7 +140,7 @@ The most recent messages stay word for word. An assistant message and the tool r
 
 The summary is a separate model call with its own prompt and no tools. It becomes a user message at the front of the history, so after a compaction `runAgent` returns a history that starts with the summary. The session file keeps every original line. Compaction appends one `compaction` record holding the summary and the `seq` where the kept messages start. `--resume` rebuilds the history from the newest one.
 
-User text, assistant text, and tool-result text in that summary request are cut to a head and a tail, marked `[... N bytes elided]`, until the estimate is under half the window. The session line keeps the full text.
+User text, assistant text, tool-call argument strings, and tool-result text in that summary request are cut to a head and a tail, marked `[... N bytes elided]`, until the estimate is under half the window. The session line keeps the full text. Tool call ids and names are left as they are.
 
 If the provider still says the request is too long (pi-ai's `isContextOverflow`), the loop compacts again, keeping only the newest group, and retries that call once. If there is nothing older to summarize, or the retry is too long as well, the run fails with `The conversation does not fit in the model's context window.`
 
