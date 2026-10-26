@@ -64,8 +64,20 @@ async function fauxSummary({ previous, replaced }: SummaryInput): Promise<string
 }
 
 function toolCall(history: readonly Message[], name: string, args: Record<string, string>): AssistantMessage {
-  const made = history.flatMap((message) => (message.role === "assistant" ? toolCallsOf(message) : [])).length;
-  return fauxAssistantMessage([fauxToolCall(name, args, { id: `faux-${made + 1}` })], { stopReason: "toolUse" });
+  return fauxAssistantMessage([fauxToolCall(name, args, { id: nextFauxCallId(history) })], { stopReason: "toolUse" });
+}
+
+// Counting visible calls repeats a kept id once an earlier call has been summarized away.
+function nextFauxCallId(history: readonly Message[]): string {
+  let max = 0;
+  for (const message of history) {
+    if (message.role !== "assistant") continue;
+    for (const call of toolCallsOf(message)) {
+      const n = Number(/^faux-(\d+)$/.exec(call.id)?.[1]);
+      if (n > max) max = n;
+    }
+  }
+  return `faux-${max + 1}`;
 }
 
 function filenameIn(prompt: string): string | undefined {

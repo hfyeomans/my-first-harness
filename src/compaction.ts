@@ -1,3 +1,4 @@
+import { contentText, type Message } from "@earendil-works/pi-ai";
 import { estimateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import type { CompactionReason, Session, SessionEntry } from "./session.js";
 import type { ModelContext } from "./types.js";
@@ -11,6 +12,13 @@ export const COMPACT_AT_RATIO = 0.75;
 
 /** Leaves about half the window for new work before the next compaction. */
 export const KEEP_RECENT_RATIO = 0.25;
+
+/**
+ * The summary request has to fit in the same window as the conversation.
+ * Tool-result text in that request is cut until the estimate is under this
+ * share. The session file keeps the full result.
+ */
+const SUMMARY_INPUT_RATIO = 0.5;
 
 /**
  * Replace older turns with one summary. `threshold` runs only when the
@@ -39,12 +47,65 @@ export async function compact(session: Session, context: ModelContext, reason: C
   if (replaced.length === 0 || !firstKept) return false;
 
   const previous = messages.length > session.entries().length ? messages[0] : undefined;
+  const previousText = typeof previous?.content === "string" ? previous.content : undefined;
   const summary = await context.summarize({
-    previous: typeof previous?.content === "string" ? previous.content : undefined,
-    replaced: replaced.map((entry) => entry.message),
+    previous: previousText,
+    replaced: capToolResults(
+      replaced.map((entry) => entry.message),
+      context.window,
+      previousText,
+    ),
   });
   await session.appendCompaction({ reason, firstKept: firstKept.seq, summary });
   return true;
+}
+
+function capToolResults(messages: readonly Message[], window: number, previous: string | undefined): Message[] {
+  const budget = Math.max(1, Math.floor(window * SUMMARY_INPUT_RATIO));
+  const previousTokens =
+    previous === undefined ? 0 : estimateMessageTokens({ role: "user", content: previous, timestamp: 0 });
+  const target = Math.max(1, budget - previousTokens);
+  if (!messages.some((message) => message.role === "toolResult")) return messages.slice();
+
+  let cap = longestToolText(messages);
+  let capped = messages.slice();
+  while (tokenSum(capped) > target && cap > 1) {
+    cap = Math.max(1, Math.floor(cap / 2));
+    capped = messages.map((message) => capToolResult(message, cap));
+  }
+  return capped;
+}
+
+function tokenSum(messages: readonly Message[]): number {
+  return messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+}
+
+function longestToolText(messages: readonly Message[]): number {
+  let longest = 0;
+  for (const message of messages) {
+    if (message.role !== "toolResult") continue;
+    const length = contentText(message.content).length;
+    if (length > longest) longest = length;
+  }
+  return longest;
+}
+
+function capToolResult(message: Message, maxChars: number): Message {
+  if (message.role !== "toolResult") return message;
+  const text = contentText(message.content);
+  if (text.length <= maxChars) return message;
+  return { ...message, content: [{ type: "text", text: elideMiddle(text, maxChars) }] };
+}
+
+function elideMiddle(text: string, maxChars: number): string {
+  const markerFor = (omitted: string): string => `\n[... ${Buffer.byteLength(omitted)} bytes elided]\n`;
+  const fullMarker = markerFor(text);
+  if (fullMarker.length >= maxChars) return fullMarker.slice(0, maxChars);
+  const room = maxChars - fullMarker.length;
+  const headLen = Math.ceil(room / 2);
+  const tailLen = Math.floor(room / 2);
+  const omitted = text.slice(headLen, text.length - tailLen);
+  return text.slice(0, headLen) + markerFor(omitted) + text.slice(text.length - tailLen);
 }
 
 // A group starts at every entry that is not a tool result, so a cut between

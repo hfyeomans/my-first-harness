@@ -134,11 +134,13 @@ If the process died while writing, the last line can be incomplete. `--resume` d
 
 ### Compaction
 
-Before each model call, the loop estimates the conversation's size with pi-ai's `estimateContextTokens`. When the estimate passes `COMPACT_AT_RATIO` (75%) of the model's context window, the loop asks the model to summarize the older messages and replaces them with that summary. The window is `Model.contextWindow` from the pi-ai catalog. Nothing in the loop names a size. Both ratios live in `src/compaction.ts`.
+Before each model call, the loop estimates the conversation's size with pi-ai's `estimateContextTokens`. When the estimate passes `COMPACT_AT_RATIO` (75%) of the model's context window, the loop asks the model to summarize the older messages and replaces them with that summary. The window is `Model.contextWindow` from the pi-ai catalog. Nothing in the loop names a size. The ratios live in `src/compaction.ts`.
 
 The most recent messages stay word for word. An assistant message and the tool results after it form one group, and only whole groups are summarized, so a tool call is never split from its results. The newest group is always kept. Older groups are kept while they fit in `KEEP_RECENT_RATIO` (25%) of the window.
 
 The summary is a separate model call with its own prompt and no tools. It becomes a user message at the front of the history, so after a compaction `runAgent` returns a history that starts with the summary. The session file keeps every original line. Compaction appends one `compaction` record holding the summary and the `seq` where the kept messages start. `--resume` rebuilds the history from the newest one.
+
+Tool-result text in that summary request is cut to a head and a tail, marked `[... N bytes elided]`, until the estimate is under half the window. The session line keeps the full text.
 
 If the provider still says the request is too long (pi-ai's `isContextOverflow`), the loop compacts again, keeping only the newest group, and retries that call once. If there is nothing older to summarize, or the retry is too long as well, the run fails with `The conversation does not fit in the model's context window.`
 

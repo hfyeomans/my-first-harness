@@ -225,6 +225,8 @@ describe("compaction", () => {
 
     assert.match(finalAnswer(messages) ?? "", /^Earlier you asked: Read big\.txt\n\(faux summary/);
     assert.equal(JSON.stringify(messages).includes(huge), false);
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes(huge), true);
     const resumed = await resumeSession(sessions, opened.id);
     assert.deepEqual(resumed.session.messages(), messages);
   });
@@ -253,7 +255,9 @@ describe("compaction", () => {
     );
 
     assert.deepEqual(seen, ["faux-3"]);
-    const ids = messages.flatMap((message) => (message.role === "assistant" ? toolCallsOf(message).map((call) => call.id) : []));
+    const ids = messages.flatMap((message) =>
+      message.role === "assistant" ? toolCallsOf(message).map((call) => call.id) : [],
+    );
     assert.ok(ids.includes("faux-2"));
     assert.equal(new Set(ids).size, ids.length);
   });
