@@ -53,6 +53,33 @@ test("faux provider reads a file and prints the tool call to stderr", async () =
   }
 });
 
+test("a piped answer larger than the pipe buffer is delivered whole", { timeout: 20_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-pipe-"));
+  try {
+    // Large enough that exiting before the pipe drains drops the tail.
+    const payload = `${"a".repeat(150_000)}\n`;
+    await writeFile(path.join(dir, "sample.txt"), payload);
+    const tsx = fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url));
+    const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+    const result = await run(process.execPath, [
+      tsx,
+      cli,
+      "-p",
+      "Read sample.txt",
+      "--provider",
+      "faux",
+      "--cwd",
+      dir,
+    ]);
+    const expected = `The file says:\n${payload}`;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.length, expected.length);
+    assert.equal(result.stdout, expected);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("the cli process runs the faux model end to end", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-proc-"));
   try {

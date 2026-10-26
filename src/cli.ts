@@ -158,12 +158,14 @@ if (isDirectRun()) {
     cwd: process.cwd(),
   }).then(
     (code) => {
-      process.exit(code);
+      // A full pipe flushes only after we return to the event loop. process.exit
+      // drops that queue, so a large answer can leave with status 0 and be cut off.
+      process.exitCode = code;
     },
     (err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`${message}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     },
   );
 }

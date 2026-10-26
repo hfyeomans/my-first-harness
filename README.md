@@ -85,7 +85,7 @@ Start at `runAgent` in `src/loop.ts`.
 5. `toolResultMessage` is the only conversion. It turns our `ToolResult` into a pi-ai message with `role: "toolResult"`, `toolCallId`, `toolName`, and `isError`. That message is appended, and the loop calls the model again with the whole transcript.
 6. Each model call counts as one turn. `DEFAULT_MAX_TURNS` is 8. Tool calls from the last allowed call still run, and then `runAgent` returns without another model call. `finalAnswer` is undefined in that case, and `main` exits with status 1 and writes `stopped after N model turns` to stderr.
 
-The only tool in this step is `readFileTool` in `src/read-file.ts`. `parse` checks the arguments with pi-ai's `validateToolArguments`. `run` reads a UTF-8 file whose path stays inside the working directory. A missing file, a directory, a binary file, a file over 200000 bytes, or a path that escapes the directory comes back as `{ ok: false, error }`.
+The only tool in this step is `readFileTool` in `src/read-file.ts`. `parse` checks the arguments with pi-ai's `validateToolArguments`. `run` reads a UTF-8 file whose path stays inside the working directory. A missing file, a directory, bytes that are not valid UTF-8, a UTF-8 file that contains a NUL byte, a file over 200000 bytes, or a path that escapes the directory comes back as `{ ok: false, error }`. A file of valid UTF-8 with no NUL byte is returned, including one that happens to be data rather than prose.
 
 ## Types
 

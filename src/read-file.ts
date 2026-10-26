@@ -1,5 +1,4 @@
-import type { Stats } from "node:fs";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { open, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { Type, validateToolArguments, type JsonObject, type Static } from "@earendil-works/pi-ai";
 import type { Tool, ToolResult } from "./types.js";
@@ -7,7 +6,7 @@ import type { Tool, ToolResult } from "./types.js";
 const MAX_BYTES = 200_000;
 
 const DESCRIPTION =
-  "Read a UTF-8 text file. The path is relative to the working directory and must stay inside it. Refuses directories, binary files, and files larger than 200000 bytes.";
+  "Read a UTF-8 text file. The path is relative to the working directory and must stay inside it. Refuses directories, files that are not valid UTF-8, files that contain a NUL byte, and files larger than 200000 bytes.";
 
 const parameters = Type.Object(
   {
@@ -74,39 +73,60 @@ async function readFileAt(rel: string, cwd: string): Promise<ToolResult> {
     return { ok: false, error: "Path escapes the working directory." };
   }
 
-  // realpath catches a symlink that lives inside cwd but points outside it.
+  // Remember the real cwd before opening. A later rename of a parent directory
+  // must not move the boundary we compare against.
   let realRoot: string;
-  let realFile: string;
   try {
     realRoot = await realpath(root);
-    realFile = await realpath(full);
   } catch (err) {
     if (isEnoent(err)) return { ok: false, error: `No such file: ${rel}` };
     return { ok: false, error: errorText(err) };
   }
-  if (escapes(realRoot, realFile)) {
-    return { ok: false, error: "Path escapes the working directory." };
-  }
 
-  let info: Stats;
+  let fh: FileHandle;
   try {
-    info = await stat(realFile);
+    fh = await open(full, "r");
   } catch (err) {
+    if (isEnoent(err)) return { ok: false, error: `No such file: ${rel}` };
+    if (isEisdir(err)) return { ok: false, error: `${rel} is not a file.` };
     return { ok: false, error: errorText(err) };
   }
-  if (!info.isFile()) return { ok: false, error: `${rel} is not a file.` };
-  if (info.size > MAX_BYTES) {
-    return { ok: false, error: `${rel} is too large to read (${info.size} bytes).` };
-  }
 
-  let text: string;
   try {
-    text = await readFile(realFile, "utf8");
+    // Check the descriptor we opened, then read that same descriptor. realpath()
+    // on the path and a later readFile() are two lookups: a directory swapped
+    // for a symlink in between would be read from outside cwd.
+    const opened = await locationOf(fh, full);
+    if (escapes(realRoot, opened)) {
+      return { ok: false, error: "Path escapes the working directory." };
+    }
+
+    const info = await fh.stat();
+    if (!info.isFile()) return { ok: false, error: `${rel} is not a file.` };
+    if (info.size > MAX_BYTES) {
+      return { ok: false, error: `${rel} is too large to read (${info.size} bytes).` };
+    }
+
+    const bytes = await fh.readFile();
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return { ok: false, error: `${rel} is not valid UTF-8.` };
+    }
+    if (text.includes("\0")) return { ok: false, error: `${rel} contains a NUL byte.` };
+    return { ok: true, output: text };
   } catch (err) {
     return { ok: false, error: errorText(err) };
+  } finally {
+    await fh.close();
   }
-  if (text.includes("\0")) return { ok: false, error: `${rel} is not a UTF-8 text file.` };
-  return { ok: true, output: text };
+}
+
+/** Canonical path of an open file. On Linux this follows the descriptor, not the name. */
+async function locationOf(fh: FileHandle, fallback: string): Promise<string> {
+  if (process.platform === "linux") return realpath(`/proc/self/fd/${fh.fd}`);
+  return realpath(fallback);
 }
 
 function escapes(root: string, target: string): boolean {
@@ -115,7 +135,15 @@ function escapes(root: string, target: string): boolean {
 }
 
 function isEnoent(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT";
+  return codeIs(err, "ENOENT");
+}
+
+function isEisdir(err: unknown): boolean {
+  return codeIs(err, "EISDIR");
+}
+
+function codeIs(err: unknown, code: string): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === code;
 }
 
 function errorText(err: unknown): string {

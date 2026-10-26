@@ -20,6 +20,11 @@ export function piModel(models: Models, model: Model<any>): AgentModel {
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
         throw new Error(assistant.errorMessage || `Model stopped (${assistant.stopReason}).`);
       }
+      // "length" means the provider cut the reply off at its output limit. Text
+      // with no tool call would otherwise look like a finished answer.
+      if (assistant.stopReason === "length") {
+        throw new Error("The model stopped because it hit its output limit.");
+      }
       return assistant;
     },
   };

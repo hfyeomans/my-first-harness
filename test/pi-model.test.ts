@@ -60,3 +60,21 @@ test("piModel completes through the faux provider, including the tool result", a
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("piModel rejects an answer cut off at the output limit", async () => {
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([fauxAssistantMessage("this answer was cut off", { stopReason: "length" })]);
+
+  await assert.rejects(
+    () =>
+      runAgent([{ role: "user", content: "Write a long answer", timestamp: 1 }], [readFileTool], {
+        model: piModel(models, model),
+      }),
+    /output limit/,
+  );
+  assert.equal(faux.state.callCount, 1);
+});
