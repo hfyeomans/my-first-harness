@@ -3,7 +3,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import { contentText, fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
+import {
+  contentText,
+  fauxAssistantMessage,
+  fauxThinking,
+  fauxToolCall,
+  type AssistantMessage,
+  type Message,
+} from "@earendil-works/pi-ai";
 import { estimateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { compact } from "../src/compaction.js";
 import { createFauxModel } from "../src/faux-model.js";
@@ -502,5 +509,51 @@ describe("compaction", () => {
     assert.equal(file.split('{"type":"compaction"').length - 1, 1);
     assert.equal(file.includes("tail-marker"), true);
     assert.equal(file.includes("call-0"), true);
+  });
+
+  test("a huge thinking block is left out of the summary and compaction still runs", async () => {
+    const sessions = path.join(dir, "sessions-thinking");
+    await mkdir(sessions);
+    const window = 200;
+    const huge = "T".repeat(200_000);
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const assistant = fauxAssistantMessage(
+      [fauxThinking(huge), { type: "text", text: "noted" }, fauxToolCall("read_file", { path: "a.txt" }, { id: "think-call" })],
+      { stopReason: "toolUse", timestamp: 2 },
+    );
+    const tail = user("tail-marker");
+    await opened.session.appendMessage(assistant);
+    await opened.session.appendMessage(tail);
+
+    const wrote = await compact(
+      opened.session,
+      {
+        window,
+        async summarize(input) {
+          assert.ok(summaryRequestTokens(input) <= Math.floor(window / 2));
+          for (const message of input.replaced) {
+            if (message.role !== "assistant") continue;
+            assert.equal(
+              message.content.some((block) => block.type === "thinking"),
+              false,
+            );
+            assert.equal(toolCallsOf(message).some((call) => call.id === "think-call"), true);
+            assert.equal(
+              message.content.some((block) => block.type === "text" && block.text === "noted"),
+              true,
+            );
+          }
+          assert.equal(JSON.stringify(input.replaced).includes(huge), false);
+          return "summary without the thinking";
+        },
+      },
+      "threshold",
+    );
+
+    assert.equal(wrote, true);
+    assert.equal(assistant.content.some((block) => block.type === "thinking" && block.thinking === huge), true);
+    assert.equal(opened.session.messages()[0]?.content, "summary without the thinking");
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes(huge), true);
   });
 });

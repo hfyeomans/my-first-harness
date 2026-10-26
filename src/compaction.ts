@@ -79,12 +79,15 @@ function fitSummaryInput(
   }
   const target = budget - (previousText === undefined ? 0 : tokensOfText(previousText));
 
-  let capped = messages.slice();
+  // The summarizer never sends thinking blocks. Leave them out of this copy
+  // so a long one cannot make the newest turn look too big to compact.
+  const source = withoutThinking(messages);
+  let capped = source;
   if (tokenSum(capped) > target) {
-    let cap = longestText(messages);
+    let cap = longestText(source);
     while (tokenSum(capped) > target && cap > 1) {
       cap = Math.max(1, Math.floor(cap / 2));
-      capped = messages.map((message) => capMessage(message, cap));
+      capped = source.map((message) => capMessage(message, cap));
     }
   }
   const replaced = tokenSum(capped) <= target ? capped : dropOldest(capped, target);
@@ -94,6 +97,13 @@ function fitSummaryInput(
 
 function tokensOfText(text: string): number {
   return estimateMessageTokens({ role: "user", content: text, timestamp: 0 });
+}
+
+function withoutThinking(messages: readonly Message[]): Message[] {
+  return messages.map((message) => {
+    if (message.role !== "assistant" || !message.content.some((block) => block.type === "thinking")) return message;
+    return { ...message, content: message.content.filter((block) => block.type !== "thinking") };
+  });
 }
 
 // Halve from the original. The same cut as a long tool result or user message.
