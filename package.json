@@ -1,0 +1,30 @@
+{
+  "name": "my-first-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Step 1 of a small coding-agent harness: the agent loop and one tool.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "myagent": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && tsx --test test/*.test.ts",
+    "myagent": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
