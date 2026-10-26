@@ -13,8 +13,9 @@ import {
 } from "@earendil-works/pi-ai";
 import { runAgent } from "../src/loop.js";
 import { finalAnswer } from "../src/messages.js";
-import { piModel } from "../src/pi-model.js";
+import { piModel, loadPiModel } from "../src/pi-model.js";
 import { readFileTool } from "../src/read-file.js";
+import { agentTools } from "../src/registry.js";
 
 test("piModel completes through the faux provider, including the tool result", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "myagent-pi-"));
@@ -30,7 +31,13 @@ test("piModel completes through the faux provider, including the tool result", a
       (context) => {
         const tools = getCurrentTools(context.messages);
         assert.ok(tools.some((tool) => tool.name === "read_file"));
-        assert.match(getCurrentSystemPrompt(context.messages), /read_file/);
+        const prompt = getCurrentSystemPrompt(context.messages);
+        assert.match(prompt, /read_file/);
+        assert.match(prompt, /write_file/);
+        assert.match(prompt, /edit_file/);
+        assert.match(prompt, /bash/);
+        assert.match(prompt, /non-zero/);
+        assert.match(prompt, /user's permissions/);
         return fauxAssistantMessage(
           [fauxToolCall("read_file", { path: "note.txt" }, { id: "call-1" })],
           { stopReason: "toolUse" },
@@ -59,6 +66,44 @@ test("piModel completes through the faux provider, including the tool result", a
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("piModel sends every registry tool as a declaration", async () => {
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    (context) => {
+      const tools = getCurrentTools(context.messages);
+      assert.deepEqual(
+        tools.map((tool) => tool.name),
+        ["read_file", "write_file", "edit_file", "bash"],
+      );
+      const edit = tools.find((tool) => tool.name === "edit_file");
+      assert.equal((edit?.parameters as { type?: string } | undefined)?.type, "object");
+      assert.equal("run" in (edit ?? {}), false);
+      return fauxAssistantMessage("done");
+    },
+  ]);
+
+  const messages = await runAgent([{ role: "user", content: "hi", timestamp: 1 }], agentTools, {
+    model: piModel(models, model),
+  });
+  assert.equal(finalAnswer(messages), "done");
+});
+
+test("claude-haiku-4-5 resolves for anthropic", async () => {
+  const model = await loadPiModel("anthropic", "claude-haiku-4-5");
+  assert.equal(typeof model.complete, "function");
+});
+
+test("an unknown model id is rejected before any request", async () => {
+  await assert.rejects(
+    () => loadPiModel("anthropic", "not-a-real-model"),
+    /Unknown model "not-a-real-model" for provider "anthropic"/,
+  );
 });
 
 test("piModel rejects an answer cut off at the output limit", async () => {

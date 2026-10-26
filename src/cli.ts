@@ -8,13 +8,14 @@ import { createFauxModel } from "./faux-model.js";
 import { DEFAULT_MAX_TURNS, runAgent } from "./loop.js";
 import { finalAnswer } from "./messages.js";
 import { loadPiModel } from "./pi-model.js";
-import { readFileTool } from "./read-file.js";
+import { agentTools } from "./registry.js";
 
-const HELP = `myagent — agent loop with one tool, read_file
+const HELP = `myagent — agent loop with read_file, write_file, edit_file, and bash
 
 Usage:
   myagent -p "Read sample.txt" --provider faux
-  myagent -p "Read sample.txt" --provider openai --model gpt-4o-mini
+  myagent -p 'Edit sample.txt, replace "hello" with "goodbye", and verify' --provider faux
+  myagent -p "Read sample.txt" --provider anthropic --model claude-haiku-4-5
 
 Options:
   -p, --prompt     Prompt text
@@ -22,12 +23,14 @@ Options:
                    (env: MYAGENT_PROVIDER)
       --model      Model id (env: MYAGENT_MODEL). Unused for faux.
       --max-turns  Maximum model calls (default ${DEFAULT_MAX_TURNS}, env: MYAGENT_MAX_TURNS)
-      --cwd        Working directory for read_file
+      --cwd        Working directory for the tools
   -h, --help
 
 The API key is that provider's own environment variable, read by
 @earendil-works/pi-ai. Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY
 (or ANTHROPIC_OAUTH_TOKEN), GEMINI_API_KEY. There is no MYAGENT_API_KEY.
+
+bash runs with your permissions. This step does not ask before it runs a command.
 `;
 
 export interface CliIo {
@@ -111,7 +114,7 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
   try {
     const model =
       provider === "faux" ? createFauxModel() : await loadPiModel(provider, modelId ?? "");
-    const messages = await runAgent(history, [readFileTool], {
+    const messages = await runAgent(history, agentTools, {
       model,
       maxTurns,
       cwd,
