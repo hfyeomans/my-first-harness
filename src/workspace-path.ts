@@ -154,11 +154,10 @@ async function commitInDir(
     // symlink as the temporary name. The original is untouched until rename.
     tmpPath = fdPath(parent, parentReal, tmpName);
     const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
-    tmp = await open(tmpPath, flags, 0o666);
+    // A replacement can hold private bytes. Create it 0600, then apply the
+    // target's mode after the write. A new file keeps 0666 masked by umask.
+    tmp = await open(tmpPath, flags, mode === undefined ? 0o666 : 0o600);
     await tmp.writeFile(content);
-    // The temp file is created 0666. Copy the target's mode before rename so
-    // a script stays executable and a private file stays private. New files
-    // keep the mode from the open above.
     if (mode !== undefined) await tmp.chmod(mode);
     await tmp.sync();
     await tmp.close();

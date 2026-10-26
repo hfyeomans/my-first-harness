@@ -114,14 +114,27 @@ test("keeps mode 0600 when overwriting", async () => {
   assert.equal((await stat(file)).mode & 0o777, 0o600);
 });
 
-test("a failed write leaves the original file and no partial file", async () => {
+test("a failed write leaves the original file and no partial file", async (t) => {
   const file = path.join(work, "keep.txt");
   await writeFile(file, "original-contents\n");
   // The file itself stays writable. The directory does not, so the temporary
   // file cannot be created. A writer that truncates first would still destroy
-  // the original.
+  // the original. Root ignores the directory mode, so probe before asserting.
   await chmod(work, 0o555);
   try {
+    const probe = path.join(work, ".probe-create");
+    let created = false;
+    try {
+      await writeFile(probe, "x");
+      created = true;
+    } catch {
+      created = false;
+    }
+    if (created) {
+      await rm(probe, { force: true });
+      t.skip("directory mode does not block creates for this process");
+      return;
+    }
     assert.equal((await write("keep.txt", "n".repeat(20_000))).ok, false);
     assert.equal((await write("fresh.txt", "new file\n")).ok, false);
     assert.equal(await readFile(file, "utf8"), "original-contents\n");
