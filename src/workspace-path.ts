@@ -64,9 +64,11 @@ export async function commitInside(
 
   const opened = await openInside(rel, cwd, constants.O_WRONLY);
   if (opened.ok) {
+    let mode: number;
     try {
       const info = await opened.handle.stat();
       if (!info.isFile()) return { ok: false, error: `${rel} is not a file.`, missing: false };
+      mode = info.mode & 0o7777;
     } catch (err) {
       return { ok: false, error: errorText(err), missing: false };
     } finally {
@@ -81,6 +83,7 @@ export async function commitInside(
       ".",
       true,
       rel,
+      mode,
     );
   }
   if (!opened.missing) return opened;
@@ -106,6 +109,7 @@ export async function commitInside(
     parentLabel(located.root, located.full),
     false,
     rel,
+    undefined,
   );
 }
 
@@ -118,6 +122,7 @@ async function commitInDir(
   missingDirLabel: string,
   replace: boolean,
   rel: string,
+  mode: number | undefined,
 ): Promise<{ ok: true } | PathFailure> {
   let realRoot: string;
   try {
@@ -151,6 +156,10 @@ async function commitInDir(
     const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
     tmp = await open(tmpPath, flags, 0o666);
     await tmp.writeFile(content);
+    // The temp file is created 0666. Copy the target's mode before rename so
+    // a script stays executable and a private file stays private. New files
+    // keep the mode from the open above.
+    if (mode !== undefined) await tmp.chmod(mode);
     await tmp.sync();
     await tmp.close();
     tmp = undefined;

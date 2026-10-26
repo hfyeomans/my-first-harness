@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -55,6 +55,15 @@ test("leaves the file unchanged when old_string is missing or repeated", async (
 
   assert.deepEqual(await edit("dup.txt", "one one", "two"), { ok: true, output: "Edited dup.txt" });
   assert.equal(await readFile(file, "utf8"), "two");
+});
+
+test("keeps mode 0755 when editing", async () => {
+  const file = path.join(work, "script.sh");
+  await writeFile(file, "echo hi\n");
+  await chmod(file, 0o755);
+  assert.deepEqual(await edit("script.sh", "echo hi", "echo bye"), { ok: true, output: "Edited script.sh" });
+  assert.equal(await readFile(file, "utf8"), "echo bye\n");
+  assert.equal((await stat(file)).mode & 0o777, 0o755);
 });
 
 test("refuses an overlapping match and leaves the file unchanged", async () => {

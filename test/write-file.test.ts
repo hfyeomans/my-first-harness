@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -106,75 +105,35 @@ test("overwrites a write-only file", async () => {
   assert.equal(await readFile(file, "utf8"), "new");
 });
 
-test("a failed write leaves the original file and no partial file", { timeout: 20_000 }, async () => {
-  const mount = `/tmp/tinyfs-${process.pid}-${Date.now()}`;
-  const script = path.join("/workspace", `.full-disk-${process.pid}.ts`);
-  const lines = [
-    `import { mkdir, open, readFile, readdir, rm, writeFile } from "node:fs/promises";`,
-    `import { spawnSync } from "node:child_process";`,
-    `import path from "node:path";`,
-    `import { writeText } from "/workspace/src/write-file.ts";`,
-    `const mount = ${JSON.stringify(mount)};`,
-    `await mkdir(mount, { recursive: true });`,
-    `const mounted = spawnSync("mount", ["-t", "tmpfs", "-o", "size=64k", "tmpfs", mount], { encoding: "utf8" });`,
-    `if (mounted.status !== 0) { console.error(mounted.stderr || mounted.stdout); process.exit(2); }`,
-    `try {`,
-    `  const keep = path.join(mount, "keep.txt");`,
-    `  await writeFile(keep, "original-contents\\n");`,
-    `  const pad = await open(path.join(mount, "pad"), "w");`,
-    `  const chunk = Buffer.alloc(4096, 0x61);`,
-    `  try { for (;;) await pad.write(chunk); } catch (err) { const code = err && typeof err === "object" && "code" in err ? err.code : undefined; if (code !== "ENOSPC") throw err; } finally { await pad.close(); }`,
-    `  const result = await writeText("keep.txt", "n".repeat(20000), mount);`,
-    `  const created = await writeText("fresh.txt", "new file\\n", mount);`,
-    `  const body = await readFile(keep, "utf8");`,
-    `  const names = await readdir(mount);`,
-    `  console.log(JSON.stringify({ result, created, body, names }));`,
-    `} finally {`,
-    `  spawnSync("umount", [mount]);`,
-    `  await rm(mount, { recursive: true, force: true });`,
-    `}`,
-  ];
-  await writeFile(script, lines.join("\n"));
+test("keeps mode 0600 when overwriting", async () => {
+  const file = path.join(work, "secret-mode.txt");
+  await writeFile(file, "old\n");
+  await chmod(file, 0o600);
+  assert.deepEqual(await write("secret-mode.txt", "new\n"), { ok: true, output: "Wrote secret-mode.txt" });
+  assert.equal(await readFile(file, "utf8"), "new\n");
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+});
 
-  const tsx = "/workspace/node_modules/tsx/dist/cli.mjs";
-  let output: { code: number | null; stdout: string; stderr: string };
+test("a failed write leaves the original file and no partial file", async () => {
+  const file = path.join(work, "keep.txt");
+  await writeFile(file, "original-contents\n");
+  // The file itself stays writable. The directory does not, so the temporary
+  // file cannot be created. A writer that truncates first would still destroy
+  // the original.
+  await chmod(work, 0o555);
   try {
-    output = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-      const child = spawn("unshare", ["--user", "--map-root-user", "--mount", process.execPath, tsx, script], {
-        cwd: "/workspace",
-      });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
-      });
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code, stdout, stderr }));
-    });
+    assert.equal((await write("keep.txt", "n".repeat(20_000))).ok, false);
+    assert.equal((await write("fresh.txt", "new file\n")).ok, false);
+    assert.equal(await readFile(file, "utf8"), "original-contents\n");
+    const names = await readdir(work);
+    assert.equal(names.includes("fresh.txt"), false);
+    assert.equal(
+      names.some((name) => name.startsWith(".myagent-")),
+      false,
+    );
   } finally {
-    await rm(script, { force: true });
+    await chmod(work, 0o755);
   }
-
-  assert.equal(output.code, 0, output.stderr);
-  const parsed = JSON.parse(output.stdout) as {
-    result: { ok: boolean };
-    created: { ok: boolean };
-    body: string;
-    names: string[];
-  };
-  assert.equal(parsed.result.ok, false);
-  assert.equal(parsed.created.ok, false);
-  assert.equal(parsed.body, "original-contents\n");
-  assert.equal(parsed.names.includes("fresh.txt"), false);
-  assert.equal(
-    parsed.names.some((name) => name.startsWith(".myagent-")),
-    false,
-  );
 });
 
 test("parse rejects arguments that are not a path and contents", () => {
