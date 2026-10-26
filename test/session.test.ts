@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -50,6 +50,13 @@ async function askAgain(work: string, opened: OpenedSession): Promise<Message[]>
     session: opened.session,
   });
 }
+
+test("a new session directory is 0700 and the file is 0600", async () => {
+  const { sessions } = await workspace();
+  const opened = await createSession(sessions, { provider: "faux", model: "", cwd: "" });
+  assert.equal((await stat(sessions)).mode & 0o777, 0o700);
+  assert.equal((await stat(path.join(sessions, `${opened.id}.jsonl`))).mode & 0o777, 0o600);
+});
 
 test("resume continues a faux conversation", async () => {
   const { work, sessions } = await workspace();

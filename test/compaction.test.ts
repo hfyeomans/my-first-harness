@@ -261,4 +261,43 @@ describe("compaction", () => {
     assert.ok(ids.includes("faux-2"));
     assert.equal(new Set(ids).size, ids.length);
   });
+
+  test("a tiny faux window compacts an oversized old user message", async () => {
+    const sessions = path.join(dir, "sessions-user");
+    await mkdir(sessions);
+    const window = 200;
+    const huge = "U".repeat(200_000);
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const faux = createFauxModel({ contextWindow: window });
+    const model: AgentModel = {
+      complete: (history, tools) => faux.complete(history, tools),
+      context: {
+        window,
+        async summarize(input) {
+          const tokens = estimateContextTokens(input.replaced).tokens;
+          if (tokens > window) {
+            throw new Error("Compaction failed. The conversation does not fit in the model's context window.");
+          }
+          const old = input.replaced.find((message) => message.role === "user");
+          assert.ok(old);
+          const text = contentText(old.content);
+          assert.match(text, /\[\.\.\. \d+ bytes elided\]/);
+          assert.ok(text.length < huge.length);
+          return faux.context!.summarize(input);
+        },
+      },
+    };
+
+    const messages = await runAgent([user(huge), user("What now?")], agentTools, {
+      model,
+      cwd: dir,
+      session: opened.session,
+    });
+
+    assert.equal(JSON.stringify(messages).includes(huge), false);
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.includes(huge), true);
+    const resumed = await resumeSession(sessions, opened.id);
+    assert.deepEqual(resumed.session.messages(), messages);
+  });
 });
