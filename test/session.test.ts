@@ -122,8 +122,9 @@ test("a bad middle line fails the resume with the file name and line number", as
 test("resume after compaction rebuilds the compacted history", async () => {
   const { work, sessions } = await workspace();
   const opened = await createSession(sessions, { provider: "faux", model: "", cwd: work });
+  // 60 keeps the stored summary inside the half of the summary budget reserved on the next compaction.
   const first = await runAgent([user("Read big.txt")], agentTools, {
-    model: createFauxModel({ contextWindow: 40 }),
+    model: createFauxModel({ contextWindow: 60 }),
     cwd: work,
     session: opened.session,
   });
@@ -135,7 +136,7 @@ test("resume after compaction rebuilds the compacted history", async () => {
   assert.deepEqual(resumed.session.messages(), first);
 
   const second = await runAgent([user("What did I ask before?")], agentTools, {
-    model: createFauxModel({ contextWindow: 40 }),
+    model: createFauxModel({ contextWindow: 60 }),
     cwd: work,
     session: resumed.session,
   });

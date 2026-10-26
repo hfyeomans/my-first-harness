@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { contentText, fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import { estimateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { compact } from "../src/compaction.js";
 import { createFauxModel } from "../src/faux-model.js";
 import { runAgent } from "../src/loop.js";
 import { finalAnswer, toolCallsOf, toolResultMessage } from "../src/messages.js";
@@ -71,9 +72,9 @@ describe("compaction", () => {
     await writeFile(path.join(dir, "sample.txt"), "hello from disk\n");
     const prompt = 'Edit sample.txt, replace "hello" with "goodbye", and verify';
     const seen: string[] = [];
-    // 64 leaves the summary of this prompt inside half the window on the next compaction.
+    // 116 compacts once, after the edit, while the prompt still fits in the summary budget.
     const messages = await runAgent([user(prompt)], agentTools, {
-      model: createFauxModel({ contextWindow: 64 }),
+      model: createFauxModel({ contextWindow: 116 }),
       cwd: dir,
       onToolCall: (call) => seen.push(call.name),
     });
@@ -439,6 +440,8 @@ describe("compaction", () => {
           assert.ok(summaryRequestTokens(input) <= Math.floor(window / 2));
           assert.match(input.previous ?? "", /\[\.\.\. \d+ bytes elided\]/);
           assert.ok((input.previous ?? "").length < huge.length);
+          const seen = input.replaced.map((message) => contentText(message.content)).join("\n");
+          assert.match(seen, /seed-kept/);
           return "summary after the previous one";
         },
       },
@@ -454,5 +457,50 @@ describe("compaction", () => {
     assert.equal(messages[0]?.content, "summary after the previous one");
     const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
     assert.equal(file.includes(huge), true);
+  });
+
+  test("a newest replaced turn that cannot fit writes no compaction and leaves the session", async () => {
+    const sessions = path.join(dir, "sessions-unfit");
+    await mkdir(sessions);
+    const window = 200;
+    const opened = await createSession(sessions, { provider: "faux", model: "faux", cwd: dir });
+    const anchor = user("anchor");
+    await opened.session.appendMessage(anchor);
+    await opened.session.appendCompaction({
+      reason: "threshold",
+      firstKept: 1,
+      summary: "P".repeat(50_000),
+    });
+    const calls = Array.from({ length: 80 }, (_, index) =>
+      fauxToolCall("read_file", { path: `f${index}.txt` }, { id: `call-${index}` }),
+    );
+    const giant = fauxAssistantMessage(calls, { stopReason: "toolUse", timestamp: 2 });
+    const tail = user("tail-marker");
+    await opened.session.appendMessage(giant);
+    await opened.session.appendMessage(tail);
+    const before = opened.session.messages();
+    let summarized = false;
+
+    const wrote = await compact(
+      opened.session,
+      {
+        window,
+        async summarize() {
+          summarized = true;
+          return "should not be stored";
+        },
+      },
+      "threshold",
+    );
+
+    assert.equal(wrote, false);
+    assert.equal(summarized, false);
+    assert.deepEqual(opened.session.messages(), before);
+    assert.equal(anchor.content, "anchor");
+    assert.equal(tail.content, "tail-marker");
+    const file = await readFile(path.join(sessions, `${opened.id}.jsonl`), "utf8");
+    assert.equal(file.split('{"type":"compaction"').length - 1, 1);
+    assert.equal(file.includes("tail-marker"), true);
+    assert.equal(file.includes("call-0"), true);
   });
 });

@@ -17,9 +17,10 @@ export const KEEP_RECENT_RATIO = 0.25;
  * The summary request has to fit in the same window as the conversation.
  * User text, assistant text, tool-call argument strings, and tool-result
  * text in that request are cut until the estimate is under this share.
- * Strings that are already short can still add up, and so can the previous
- * summary. The copy then drops the oldest turns, or cuts that previous
- * summary the same way. The session file keeps the originals.
+ * Strings that are already short can still add up. The copy then drops the
+ * oldest replaced turns. The previous summary gets at most half of this
+ * budget, so those turns keep the other half. The session file keeps the
+ * originals.
  */
 const SUMMARY_INPUT_RATIO = 0.5;
 
@@ -51,21 +52,31 @@ export async function compact(session: Session, context: ModelContext, reason: C
 
   const previous = messages.length > session.entries().length ? messages[0] : undefined;
   const previousText = typeof previous?.content === "string" ? previous.content : undefined;
-  const summary = await context.summarize(
-    fitSummaryInput(
-      replaced.map((entry) => entry.message),
-      context.window,
-      previousText,
-    ),
+  const fitted = fitSummaryInput(
+    replaced.map((entry) => entry.message),
+    context.window,
+    previousText,
   );
+  // No record for history the summarizer did not see. The loop treats false
+  // the same way it treats an overflow with nothing older to summarize.
+  if (!fitted) return false;
+  const summary = await context.summarize(fitted);
   await session.appendCompaction({ reason, firstKept: firstKept.seq, summary });
   return true;
 }
 
-function fitSummaryInput(messages: readonly Message[], window: number, previous: string | undefined): SummaryInput {
+function fitSummaryInput(
+  messages: readonly Message[],
+  window: number,
+  previous: string | undefined,
+): SummaryInput | undefined {
   const budget = Math.max(1, Math.floor(window * SUMMARY_INPUT_RATIO));
-  const previousText =
-    previous === undefined || tokensOfText(previous) <= budget ? previous : capTextToBudget(previous, budget);
+  const previousLimit = Math.floor(budget / 2);
+  let previousText = previous;
+  if (previous !== undefined && tokensOfText(previous) > previousLimit) {
+    if (previousLimit < 1) return undefined;
+    previousText = capTextToBudget(previous, previousLimit);
+  }
   const target = budget - (previousText === undefined ? 0 : tokensOfText(previousText));
 
   let capped = messages.slice();
@@ -75,9 +86,10 @@ function fitSummaryInput(messages: readonly Message[], window: number, previous:
       cap = Math.max(1, Math.floor(cap / 2));
       capped = messages.map((message) => capMessage(message, cap));
     }
-    if (tokenSum(capped) > target) capped = dropOldest(capped, target);
   }
-  return { previous: previousText, replaced: capped };
+  const replaced = tokenSum(capped) <= target ? capped : dropOldest(capped, target);
+  if (!replaced || replaced.length === 0) return undefined;
+  return { previous: previousText, replaced };
 }
 
 function tokensOfText(text: string): number {
@@ -96,20 +108,37 @@ function capTextToBudget(text: string, budget: number): string {
 }
 
 // Drop leading turns until the copy fits. A tool result stays with the call
-// ahead of it, so the copy never starts on a result whose call was dropped.
-function dropOldest(messages: readonly Message[], target: number): Message[] {
-  let start = 0;
-  while (start <= messages.length) {
-    if (messages[start]?.role === "toolResult") {
-      start += 1;
-      continue;
+// ahead of it. Older replaced messages may be omitted only because this
+// marker, and the previous summary when there is one, still cover them.
+// The newest replaced turn stays. If it does not fit, return nothing so
+// compaction writes no record.
+function dropOldest(messages: readonly Message[], target: number): Message[] | undefined {
+  const suffix = suffixTokens(messages);
+  const newest = startOfNewestTurn(messages);
+  for (let start = 0; start <= newest; start++) {
+    if (start > 0 && messages[start]?.role === "toolResult") continue;
+    const noteTokens = start === 0 ? 0 : estimateMessageTokens(omittedNote(start));
+    if ((suffix[start] ?? 0) + noteTokens <= target) {
+      const kept = messages.slice(start);
+      return start === 0 ? kept : [omittedNote(start), ...kept];
     }
-    const kept = messages.slice(start);
-    const candidate = start === 0 ? kept : [omittedNote(start), ...kept];
-    if (tokenSum(candidate) <= target) return candidate;
-    start += 1;
   }
-  return [];
+  return undefined;
+}
+
+function suffixTokens(messages: readonly Message[]): number[] {
+  const suffix = new Array<number>(messages.length + 1).fill(0);
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    suffix[index] = (suffix[index + 1] ?? 0) + (message ? estimateMessageTokens(message) : 0);
+  }
+  return suffix;
+}
+
+function startOfNewestTurn(messages: readonly Message[]): number {
+  let index = messages.length;
+  while (index > 0 && messages[index - 1]?.role === "toolResult") index -= 1;
+  return Math.max(0, index - 1);
 }
 
 function omittedNote(count: number): Message {
