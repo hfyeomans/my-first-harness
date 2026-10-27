@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { agentTools, findTool, toolDeclarations } from "../src/registry.js";
 
-test("the registry is the four tools, looked up by name", () => {
+test("the registry is the five tools, looked up by name", () => {
   const names = agentTools.map((tool) => tool.name);
-  assert.deepEqual(names, ["read_file", "write_file", "edit_file", "bash"]);
+  assert.deepEqual(names, ["read_file", "write_file", "edit_file", "bash", "remember"]);
   assert.equal(new Set(names).size, names.length);
   assert.equal(findTool(agentTools, "edit_file")?.name, "edit_file");
   assert.equal(findTool(agentTools, "nope"), undefined);
@@ -15,7 +15,7 @@ test("declarations are the pi-ai schema, without parse or run", () => {
   const declarations = toolDeclarations(agentTools);
   assert.deepEqual(
     declarations.map((tool) => tool.name),
-    ["read_file", "write_file", "edit_file", "bash"],
+    ["read_file", "write_file", "edit_file", "bash", "remember"],
   );
   for (const tool of declarations) {
     assert.equal("run" in tool, false);
@@ -36,4 +36,5 @@ test("declarations are the pi-ai schema, without parse or run", () => {
   assert.deepEqual(required("write_file"), ["path", "content"]);
   assert.deepEqual(required("edit_file"), ["path", "old_string", "new_string"]);
   assert.deepEqual(required("bash"), ["command"]);
+  assert.deepEqual(required("remember"), ["note"]);
 });

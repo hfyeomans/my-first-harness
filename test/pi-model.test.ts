@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -12,6 +12,7 @@ import {
   getCurrentTools,
 } from "@earendil-works/pi-ai";
 import { runAgent } from "../src/loop.js";
+import { readMemory, rememberTool } from "../src/memory.js";
 import { finalAnswer } from "../src/messages.js";
 import { piModel, loadPiModel } from "../src/pi-model.js";
 import { readFileTool } from "../src/read-file.js";
@@ -79,7 +80,7 @@ test("piModel sends every registry tool as a declaration", async () => {
       const tools = getCurrentTools(context.messages);
       assert.deepEqual(
         tools.map((tool) => tool.name),
-        ["read_file", "write_file", "edit_file", "bash"],
+        ["read_file", "write_file", "edit_file", "bash", "remember"],
       );
       const edit = tools.find((tool) => tool.name === "edit_file");
       assert.equal((edit?.parameters as { type?: string } | undefined)?.type, "object");
@@ -129,6 +130,63 @@ test("piModel compacts at its context window with a summary call that offers no 
     assert.equal(faux.state.callCount, 3);
     assert.equal(messages[0]?.content, "The user asked to read note.txt.");
     assert.equal(finalAnswer(messages), "the note is all n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the system prompt keeps the snapshot from the start of the run", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-pi-memory-"));
+  try {
+    await mkdir(path.join(dir, ".myagent"));
+    await writeFile(path.join(dir, ".myagent", "MEMORY.md"), "- old preference\n");
+    const snapshot = await readMemory(dir);
+
+    const faux = fauxProvider();
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = faux.getModel();
+    assert.ok(model);
+    faux.setResponses([
+      (context) => {
+        const prompt = getCurrentSystemPrompt(context.messages);
+        assert.match(prompt, /snapshotted at the start of this run/);
+        assert.match(prompt, /old preference/);
+        assert.doesNotMatch(prompt, /new preference/);
+        return fauxAssistantMessage([fauxToolCall("remember", { note: "new preference" }, { id: "mem-1" })], {
+          stopReason: "toolUse",
+        });
+      },
+      (context) => {
+        const prompt = getCurrentSystemPrompt(context.messages);
+        assert.match(prompt, /old preference/);
+        assert.doesNotMatch(prompt, /new preference/);
+        return fauxAssistantMessage("saved");
+      },
+    ]);
+
+    const messages = await runAgent([{ role: "user", content: "remember this", timestamp: 1 }], [rememberTool], {
+      model: piModel(models, model, snapshot),
+      cwd: dir,
+    });
+    assert.equal(finalAnswer(messages), "saved");
+
+    const next = await readMemory(dir);
+    assert.match(next, /old preference/);
+    assert.match(next, /new preference/);
+
+    faux.setResponses([
+      (context) => {
+        const prompt = getCurrentSystemPrompt(context.messages);
+        assert.match(prompt, /old preference/);
+        assert.match(prompt, /new preference/);
+        return fauxAssistantMessage("both");
+      },
+    ]);
+    const again = await runAgent([{ role: "user", content: "what now", timestamp: 2 }], [], {
+      model: piModel(models, model, next),
+    });
+    assert.equal(finalAnswer(again), "both");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

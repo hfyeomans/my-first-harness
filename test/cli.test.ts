@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -33,6 +33,7 @@ test("prints help", async () => {
   assert.match(streams.out(), /write_file/);
   assert.match(streams.out(), /edit_file/);
   assert.match(streams.out(), /bash/);
+  assert.match(streams.out(), /remember/);
   assert.match(streams.out(), /OPENAI_API_KEY/);
   assert.match(streams.out(), /your permissions/);
 });
@@ -154,6 +155,73 @@ test("--resume with ../ does not read outside the sessions directory", async () 
     assert.match(streams.err(), /--resume: "\.\.\/20261026-000000-abcdef" is not a session id\./);
     assert.equal(streams.out(), "");
     assert.equal(await readFile(outside, "utf8"), header);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("remember writes the project memory and the next run quotes that snapshot", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-memory-"));
+  try {
+    const empty = io(dir);
+    assert.equal(await main(["-p", "What do you remember?", "--provider", "faux", "--cwd", dir], empty), 0);
+    assert.equal(empty.out(), "Nothing is remembered yet.\n");
+
+    const first = io(dir);
+    const code = await main(["-p", 'Remember "tests use real databases"', "--provider", "faux", "--cwd", dir], first);
+    assert.equal(code, 0, first.err());
+    assert.match(first.err(), /tool remember \{"note":"tests use real databases"\}/);
+    assert.equal(first.out(), "Remembered: tests use real databases\n");
+    assert.equal(
+      await readFile(path.join(dir, ".myagent", "MEMORY.md"), "utf8"),
+      "- tests use real databases\n",
+    );
+
+    const second = io(dir);
+    assert.equal(await main(["-p", "What do you remember?", "--provider", "faux", "--cwd", dir], second), 0);
+    assert.equal(second.out(), "- tests use real databases\n");
+    assert.doesNotMatch(second.err(), /tool /);
+
+    const resumed = io(dir);
+    const resume = await main(
+      ["--resume", "-p", "What do you remember?", "--provider", "faux", "--cwd", dir],
+      resumed,
+    );
+    assert.equal(resume, 0, resumed.err());
+    assert.equal(resumed.out(), "- tests use real databases\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("memory follows --cwd and a bad memory file leaves no session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-cli-memory-cwd-"));
+  try {
+    const work = path.join(dir, "work");
+    await mkdir(work);
+    const streams = io(dir);
+    assert.equal(
+      await main(
+        ["-p", 'Remember "in the project"', "--provider", "faux", "--cwd", work, "--sessions-dir", "store"],
+        streams,
+      ),
+      0,
+      streams.err(),
+    );
+    assert.equal(await readFile(path.join(work, ".myagent", "MEMORY.md"), "utf8"), "- in the project\n");
+    assert.equal(existsSync(path.join(dir, "store")), true);
+    assert.equal(existsSync(path.join(work, ".myagent", "sessions")), false);
+
+    await writeFile(path.join(work, ".myagent", "MEMORY.md"), Buffer.from([0xff]));
+    const failed = io(dir);
+    const code = await main(
+      ["-p", "Read sample.txt", "--provider", "faux", "--cwd", work, "--sessions-dir", "store"],
+      failed,
+    );
+    assert.equal(code, 1);
+    assert.match(failed.err(), /MEMORY\.md is not valid UTF-8/);
+    const files = (await readdir(path.join(dir, "store"))).filter((name) => name.endsWith(".jsonl"));
+    assert.equal(files.length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
