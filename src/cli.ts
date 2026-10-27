@@ -5,12 +5,13 @@ import { pathToFileURL } from "node:url";
 import { missingApiKey } from "./api-key.js";
 import { createFauxModel } from "./faux-model.js";
 import { DEFAULT_MAX_TURNS, runAgent } from "./loop.js";
+import { readMemory } from "./memory.js";
 import { finalAnswer } from "./messages.js";
 import { loadPiModel } from "./pi-model.js";
 import { agentTools } from "./registry.js";
 import { createSession, parseSessionId, resumeSession, SESSIONS_SUBDIR } from "./session.js";
 
-const HELP = `myagent — agent loop with read_file, write_file, edit_file, and bash
+const HELP = `myagent — agent loop with read_file, write_file, edit_file, bash, and remember
 
 Usage:
   myagent -p "Read sample.txt" --provider faux
@@ -133,11 +134,14 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
   const sessionsDir = sessionsFlag ? path.resolve(io.cwd, sessionsFlag) : path.join(cwd, SESSIONS_SUBDIR);
 
   try {
-    // Before the session opens, so an unknown model id leaves no session file.
+    // Before the session opens, so an unknown model id or a bad memory file
+    // leaves no session file. The snapshot is fixed for this run: remember
+    // writes the file, and the next run is what puts that note in the prompt.
+    const memory = await readMemory(cwd);
     const model =
       provider === "faux"
-        ? createFauxModel({ contextWindow: fauxWindow })
-        : await loadPiModel(provider, modelId ?? "");
+        ? createFauxModel({ contextWindow: fauxWindow, memory })
+        : await loadPiModel(provider, modelId ?? "", memory);
     const opened =
       values.resume === undefined
         ? await createSession(sessionsDir, { provider, model: modelId ?? "faux", cwd })

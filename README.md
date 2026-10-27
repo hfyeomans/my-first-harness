@@ -1,6 +1,6 @@
 # my-first-harness
 
-A small coding agent you can read in one sitting. The loop is `runAgent` in `src/loop.ts`. Model calls go through `@earendil-works/pi-ai`. The tools are `read_file`, `write_file`, `edit_file`, and `bash`. This step saves every run as a session you can resume, and compacts a long conversation so it fits the model's context window.
+A small coding agent you can read in one sitting. The loop is `runAgent` in `src/loop.ts`. Model calls go through `@earendil-works/pi-ai`. The tools are `read_file`, `write_file`, `edit_file`, `bash`, and `remember`. A run is saved as a session you can resume, and a long conversation is compacted so it fits the model's context window. This step adds a memory file: a note saved with `remember` is snapshotted into the system prompt of the next run.
 
 `@earendil-works/pi-ai` is the published name of the `packages/ai` package from [pi](https://github.com/earendil-works/pi). This repo was written against version 1.4.0.
 
@@ -102,7 +102,7 @@ node dist/cli.js -p "Read sample.txt and quote the first line" --provider anthro
 
 Start at `runAgent` in `src/loop.ts`.
 
-1. It appends the history to the session, compacts if the session is getting too big (see [Compaction](#compaction)), and calls `model.complete` with `session.messages()`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the declarations from `toolDeclarations` and a short system prompt. The prompt names the four tools, says that a non-zero bash exit is a result, and says that bash runs with the user's permissions. The CLI passes `agentTools` from `src/registry.ts`. A test can pass a different list.
+1. It appends the history to the session, compacts if the session is getting too big (see [Compaction](#compaction)), and calls `model.complete` with `session.messages()`. For a real provider, that model is `piModel` in `src/pi-model.ts`, which calls pi-ai's `models.complete` with the declarations from `toolDeclarations` and a short system prompt. The prompt names the five tools, says that a non-zero bash exit is a result, says that bash runs with the user's permissions, and appends the memory snapshot taken at the start of the run (see [Memory](#memory)). The CLI passes `agentTools` from `src/registry.ts`. A test can pass a different list.
 2. The assistant message comes back as pi-ai sent it. `classifyReply` (`src/messages.ts`) decides what it means. `stop` and `toolUse` are accepted and appended. A context overflow is retried once after compacting. Any other stop throws. A `length` stop throws `The model stopped because it hit its output limit.` An error throws the provider's message. A refused reply is never appended. `toolCallsOf` collects content blocks whose `type` is `"toolCall"`.
 3. When there are no tool calls, `runAgent` returns. That assistant text is the answer. `finalAnswer` finds it, and `main` writes it to stdout.
 4. When there are tool calls, `main`'s `onToolCall` writes a `tool <name> <json>` line to stderr. Then the private `executeTool` calls `findTool`. An unknown name becomes `{ ok: false, error }`. Otherwise it calls `parse` and `run`. If either throws, that error is also `{ ok: false }`. The loop keeps going.
@@ -162,13 +162,43 @@ Earlier you asked: Read big.txt
 
 The answer quotes the summary. After compaction, the summary is the earlier message the model can see.
 
+## Memory
+
+A session keeps the conversation. It does not keep a preference once you start a new session, and compaction can drop the turn where you said it. `remember` writes that kind of note to `.myagent/MEMORY.md` in the working directory, one bullet per line. The directory is created mode `0700` and a new file mode `0600`, the same as a session, because a note can be something you would not commit.
+
+`readMemory` in `src/memory.ts` reads that file once, when the run starts, before the model is called and before the session file is created. A missing file is an empty snapshot. `piModel` appends the snapshot to the system prompt and keeps that same string for every call in the run. A `remember` during the run is in the tool result, so the model can see it, and the next run is what puts it in the prompt. The summary call does not see the snapshot. Its prompt is only about the conversation.
+
+The snapshot is the tail of the file, at most 8000 bytes, cut on a line. Older notes stay on disk. The prompt says they were omitted. `remember` refuses an empty note, a line break, and a note longer than 500 characters, so one append stays small enough that two writers do not tear a single line.
+
+The file is plain markdown. You can edit it or delete it. An empty snapshot is the line `(none)`.
+
+```bash
+pnpm exec tsx src/cli.ts -p 'Remember "tests use real databases"' --provider faux
+pnpm exec tsx src/cli.ts -p "What do you remember?" --provider faux
+```
+
+```
+session 20261026-140722-ab12cd
+tool remember {"note":"tests use real databases"}
+Remembered: tests use real databases
+```
+
+The second command prints:
+
+```
+session 20261026-140723-ef34ab
+- tests use real databases
+```
+
+There is no tool call the second time. The faux script quotes the snapshot it was given, which is the same string a real model gets in the system prompt. `--resume` takes a new snapshot, so a note saved earlier in that session is there. `--cwd` chooses the project the file lives in. `--sessions-dir` does not. There is no search over the notes, and no way to delete one except by editing the file.
+
 ## The tool registry
 
 `src/registry.ts` is the list of tools.
 
-`agentTools` is a plain array: `read_file`, `write_file`, `edit_file`, `bash`. `findTool(tools, name)` walks that array. `toolDeclarations(tools)` maps each tool through pi-ai's `toToolDeclaration`, which keeps `name`, `description`, and `parameters` and drops `parse` and `run`. That object is what the provider sees. The functions stay in this process.
+`agentTools` is a plain array: `read_file`, `write_file`, `edit_file`, `bash`, `remember`. `findTool(tools, name)` walks that array. `toolDeclarations(tools)` maps each tool through pi-ai's `toToolDeclaration`, which keeps `name`, `description`, and `parameters` and drops `parse` and `run`. That object is what the provider sees. The functions stay in this process.
 
-Four tools do not need a class, a map built at startup, or a register function. Those would only wrap the same three things: the list, the lookup, and the declaration. A new tool later is a file plus one line in the array. The loop still takes the array as an argument, which is why a test can pass one tool, or a tool that throws, without editing the registry.
+Five tools do not need a class, a map built at startup, or a register function. Those would only wrap the same three things: the list, the lookup, and the declaration. A new tool later is a file plus one line in the array. The loop still takes the array as an argument, which is why a test can pass one tool, or a tool that throws, without editing the registry.
 
 ## Why tool errors look like this
 
