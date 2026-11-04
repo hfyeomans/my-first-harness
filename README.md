@@ -164,13 +164,15 @@ The answer quotes the summary. After compaction, the summary is the earlier mess
 
 ## Memory
 
-A session keeps the conversation. It does not keep a preference once you start a new session, and compaction can drop the turn where you said it. `remember` writes that kind of note to `.myagent/MEMORY.md` in the working directory, one bullet per line. The directory is created mode `0700` and a new file mode `0600`, the same as a session, because a note can be something you would not commit.
+A session keeps the conversation. It does not keep a preference once you start a new session, and compaction can drop the turn where you said it. `remember` writes that kind of note to `.myagent/MEMORY.md` in the working directory, one bullet per line. The directory is created mode `0700` and a new file mode `0600`, the same as a session, because a note can be something you would not commit. If the file is already readable by anyone else, `remember` sets it to `0600` before appending. If that fails, the note is not written.
 
 `readMemory` in `src/memory.ts` reads that file once, when the run starts, before the model is called and before the session file is created. A missing file is an empty snapshot. `piModel` appends the snapshot to the system prompt and keeps that same string for every call in the run. A `remember` during the run is in the tool result, so the model can see it, and the next run is what puts it in the prompt. The summary call does not see the snapshot. Its prompt is only about the conversation.
 
-The snapshot is the tail of the file, at most 8000 bytes, cut on a line. Older notes stay on disk. The prompt says they were omitted. `remember` refuses an empty note, a line break, and a note longer than 500 characters, so one append stays small enough that two writers do not tear a single line.
+The read and the append both open `.myagent` and check that descriptor, then open `MEMORY.md` through it with `O_NOFOLLOW`. A symbolic link at either name is refused, including one that points outside the working directory. The note is not written to the link's target, and the target is not copied into the prompt.
 
-The file is plain markdown. You can edit it or delete it. An empty snapshot is the line `(none)`.
+The snapshot is the tail of the file, at most 8000 bytes, cut on a line. A line the tail starts inside of is left out, not shown as a shortened note. Older notes stay on disk. The prompt says they were omitted. `remember` refuses an empty note, a line break (including one at either end), a NUL byte, and a note longer than 500 characters, so one append stays small enough that two writers do not tear a single line. A NUL already in the file is dropped from the snapshot, so that byte does not stop the next run. The file on disk is left as it was.
+
+The file is plain markdown. You can edit it or delete it. An empty snapshot is the line `(none)`. The system prompt puts the notes between `Remembered notes begin` and `Remembered notes end`, and says they are untrusted data from `.myagent/MEMORY.md`, including a file that came with a checkout. That warning is not a guarantee the model will ignore an instruction written there.
 
 ```bash
 pnpm exec tsx src/cli.ts -p 'Remember "tests use real databases"' --provider faux

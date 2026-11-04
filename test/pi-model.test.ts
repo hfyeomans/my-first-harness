@@ -151,6 +151,8 @@ test("the system prompt keeps the snapshot from the start of the run", async () 
       (context) => {
         const prompt = getCurrentSystemPrompt(context.messages);
         assert.match(prompt, /snapshotted at the start of this run/);
+        assert.match(prompt, /untrusted data from \.myagent\/MEMORY\.md/);
+        assert.match(prompt, /Remembered notes begin/);
         assert.match(prompt, /old preference/);
         assert.doesNotMatch(prompt, /new preference/);
         return fauxAssistantMessage([fauxToolCall("remember", { note: "new preference" }, { id: "mem-1" })], {

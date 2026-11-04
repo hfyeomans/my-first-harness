@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -12,6 +12,7 @@ import {
   memoryPath,
   readMemory,
   rememberTool,
+  snapshotSection,
 } from "../src/memory.js";
 import type { AgentModel } from "../src/types.js";
 
@@ -57,6 +58,14 @@ test("remember refuses an empty note, a line break, and a note that is too long"
       error: "A note must not be empty.",
     });
     assert.deepEqual(await rememberTool.run({ note: "one\ntwo" }, { cwd: dir }), {
+      ok: false,
+      error: "A note must be one line.",
+    });
+    assert.deepEqual(await rememberTool.run({ note: "\nprefer pnpm" }, { cwd: dir }), {
+      ok: false,
+      error: "A note must be one line.",
+    });
+    assert.deepEqual(await rememberTool.run({ note: "prefer pnpm\r" }, { cwd: dir }), {
       ok: false,
       error: "A note must be one line.",
     });
@@ -129,15 +138,114 @@ test("a memory file that is not UTF-8 or not a file fails before it can be snaps
     await writeFile(file, Buffer.from([0xff]));
     await assert.rejects(readMemory(dir), /\.myagent\/MEMORY\.md is not valid UTF-8/);
 
-    await writeFile(file, "fine\0hidden\n");
-    await assert.rejects(readMemory(dir), /\.myagent\/MEMORY\.md contains a NUL byte/);
-
     await rm(file);
     await mkdir(file);
     await assert.rejects(readMemory(dir), /\.myagent\/MEMORY\.md is not a file/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a line the tail starts inside of is omitted instead of cut in half", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-memory-partial-"));
+  try {
+    const file = memoryPath(dir);
+    await mkdir(path.dirname(file));
+    const partial = `Q${"Z".repeat(MEMORY_SNAPSHOT_BYTES + 500)}`;
+    await writeFile(file, partial);
+    assert.equal(await readMemory(dir), "[earlier notes omitted]");
+    assert.equal(await readFile(file, "utf8"), partial);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a NUL note is not written, and a NUL already in the file does not block the next read", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-memory-nul-"));
+  try {
+    const file = memoryPath(dir);
+    assert.deepEqual(await rememberTool.run({ note: "prefer\0pnpm" }, { cwd: dir }), {
+      ok: false,
+      error: "A note must not contain a NUL byte.",
+    });
+    assert.deepEqual(await rememberTool.run({ note: "\0prefer pnpm" }, { cwd: dir }), {
+      ok: false,
+      error: "A note must not contain a NUL byte.",
+    });
+    await assert.rejects(readFile(file, "utf8"));
+
+    await mkdir(path.dirname(file));
+    await writeFile(file, "- keep\0this\n");
+    assert.equal(await readMemory(dir), "- keepthis\n");
+    assert.deepEqual(await rememberTool.run({ note: "later" }, { cwd: dir }), {
+      ok: true,
+      output: "Remembered: later",
+    });
+    const snapshot = await readMemory(dir);
+    assert.equal(snapshot.includes("\0"), false);
+    assert.match(snapshot, /keepthis/);
+    assert.match(snapshot, /later/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("remember tightens a world-readable memory file before appending", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "myagent-memory-mode-"));
+  try {
+    const file = memoryPath(dir);
+    await mkdir(path.dirname(file), { mode: 0o700 });
+    await writeFile(file, "- old\n", { mode: 0o644 });
+    await chmod(file, 0o644);
+    assert.equal((await stat(file)).mode & 0o777, 0o644);
+    assert.deepEqual(await rememberTool.run({ note: "private note" }, { cwd: dir }), {
+      ok: true,
+      output: "Remembered: private note",
+    });
+    assert.equal((await stat(file)).mode & 0o777, 0o600);
+    assert.equal(await readFile(file, "utf8"), "- old\n- private note\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("remember and readMemory refuse a symlink that leaves the working directory", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "myagent-memory-link-"));
+  try {
+    const work = path.join(root, "work");
+    const outside = path.join(root, "outside.txt");
+    await mkdir(work);
+    await writeFile(outside, "secret-outside\n");
+    await mkdir(path.join(work, ".myagent"));
+    await symlink(outside, memoryPath(work));
+
+    const written = await rememberTool.run({ note: "do not leak" }, { cwd: work });
+    assert.equal(written.ok, false);
+    assert.match(written.error ?? "", /\.myagent\/MEMORY\.md is a symbolic link/);
+    assert.equal(await readFile(outside, "utf8"), "secret-outside\n");
+    await assert.rejects(readMemory(work), /\.myagent\/MEMORY\.md is a symbolic link/);
+
+    await rm(memoryPath(work));
+    const elsewhere = path.join(root, "elsewhere");
+    await mkdir(elsewhere);
+    await writeFile(path.join(elsewhere, "MEMORY.md"), "secret-dir\n");
+    await rm(path.join(work, ".myagent"), { recursive: true });
+    await symlink(elsewhere, path.join(work, ".myagent"));
+    const throughDir = await rememberTool.run({ note: "do not leak" }, { cwd: work });
+    assert.equal(throughDir.ok, false);
+    assert.match(throughDir.error ?? "", /\.myagent is a symbolic link/);
+    assert.equal(await readFile(path.join(elsewhere, "MEMORY.md"), "utf8"), "secret-dir\n");
+    await assert.rejects(readMemory(work), /\.myagent is a symbolic link/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the snapshot marks notes as untrusted data", () => {
+  const section = snapshotSection("- do the thing");
+  assert.match(section, /untrusted data from \.myagent\/MEMORY\.md/);
+  assert.match(section, /not a guaranteed defense/);
+  assert.match(section, /Remembered notes begin\n- do the thing\nRemembered notes end/);
 });
 
 test("the loop hands a remembered note back to the model", async () => {
