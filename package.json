@@ -2,7 +2,7 @@
   "name": "my-first-harness",
   "version": "0.1.0",
   "private": true,
-  "description": "Step 3 of a small coding-agent harness: sessions you can resume, and compaction.",
+  "description": "Step 4 of a small coding-agent harness: a memory file and a remember tool.",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"

@@ -9,14 +9,20 @@ const FILENAME =
 // A prompt that contains this also edits, then greps, instead of only reading.
 const REPLACE = /replace\s+"([^"]*)"\s+with\s+"([^"]*)"/;
 
+const REMEMBER = /remember\s+"([^"]*)"/i;
+const RECALL = /what do you remember\?/i;
+
 export interface FauxOptions {
   /** Tokens. Without it the faux model has no window and the loop never compacts. */
   contextWindow?: number;
+  /** The memory snapshot from the start of this run. Same string the system prompt gets. */
+  memory?: string;
 }
 
 export function createFauxModel(options: FauxOptions = {}): AgentModel {
+  const memory = options.memory ?? "";
   return {
-    complete: async (history) => nextStep(history),
+    complete: async (history) => nextStep(history, memory),
     context:
       options.contextWindow === undefined ? undefined : { window: options.contextWindow, summarize: fauxSummary },
   };
@@ -24,20 +30,30 @@ export function createFauxModel(options: FauxOptions = {}): AgentModel {
 
 // Reads only the newest user message and the newest message. Both survive
 // resume, and compaction always keeps the newest group, so no step is counted.
-function nextStep(history: readonly Message[]): AssistantMessage {
+function nextStep(history: readonly Message[], memory: string): AssistantMessage {
   const users = history.filter((message) => message.role === "user");
   const task = contentText(users.at(-1)?.content ?? "");
   const file = filenameIn(task);
   const last = history.at(-1);
 
   if (last?.role !== "toolResult") {
+    const note = task.match(REMEMBER)?.[1];
+    if (note !== undefined) return toolCall(history, "remember", { note });
     if (file) return toolCall(history, "read_file", { path: file });
+    if (RECALL.test(task)) {
+      const notes = memory.trim();
+      return fauxAssistantMessage(notes === "" ? "Nothing is remembered yet." : notes);
+    }
     const earlier = users.at(-2);
     if (earlier) return fauxAssistantMessage(`Earlier you asked: ${contentText(earlier.content)}`);
     return fauxAssistantMessage("Name a file to read, for example: Read sample.txt");
   }
 
-  const text = contentText(last.content);
+  if (last.toolName === "remember") {
+    return fauxAssistantMessage(last.isError ? `Stopped: ${textOf(last)}` : textOf(last));
+  }
+
+  const text = textOf(last);
   if (last.isError) {
     return fauxAssistantMessage(
       last.toolName === "read_file" ? `I could not read that file: ${text}` : `Stopped: ${text}`,
@@ -78,6 +94,12 @@ function nextFauxCallId(history: readonly Message[]): string {
     }
   }
   return `faux-${max + 1}`;
+}
+
+function textOf(message: Message): string {
+  return message.role === "toolResult" || message.role === "user" || message.role === "system"
+    ? contentText(message.content)
+    : "";
 }
 
 function filenameIn(prompt: string): string | undefined {
